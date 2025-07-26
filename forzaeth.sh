@@ -5,7 +5,6 @@ mkdir src
 catkin_make
 cd src
 git clone --recurse-submodules https://github.com/ForzaETH/race_stack.git
-git clone https://github.com/f1tenth/f1tenth_simulator.git
 cd race_stack
 xargs sudo apt-get install -y < ./.devcontainer/.install_utils/linux_req_sim.txt
 pip install -r ./.devcontainer/.install_utils/requirements.txt
