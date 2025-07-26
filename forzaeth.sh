@@ -9,5 +9,6 @@ xargs sudo apt-get install -y < ./.devcontainer/.install_utils/linux_req_sim.txt
 pip install -r ./.devcontainer/.install_utils/requirements.txt
 pip install ~/catkin_ws/src/race_stack/f110_utils/libs/ccma
 pip install -e ~/catkin_ws/src/race_stack/planner/graph_based_planner/src/GraphBasedPlanner
-cd ..
+cd ../..
+pip install pydantic
 catkin_make_isolated
