@@ -13,3 +13,4 @@ bash ./state_estimation/cartographer_pbl/cartographer/scripts/install_abseil.sh
 cd ../..
 pip install pydantic
 catkin_make_isolated
+sudo bash ./src/race_stack/.devcontainer/.install_utils/install_acados.sh
