@@ -1,4 +1,4 @@
-sudo apt-get install -y ros-noetic-tf2-geometry-msgs ros-noetic-ackermann-msgs ros-noetic-joy ros-noetic-map-server lua5.3-dev
+sudo apt-get install -y ros-noetic-tf2-geometry-msgs ros-noetic-ackermann-msgs ros-noetic-joy ros-noetic-map-server lua5.3-dev ninja-build
 mkdir forzaeth_ws
 cd forzaeth_ws
 mkdir src
