@@ -1,0 +1,43 @@
+0 :: 934 LAP COMPLETE: Time: 23.35, Progress: 99.6
+1 :: 1866 LAP COMPLETE: Time: 23.30, Progress: 99.8
+2 :: 2797 LAP COMPLETE: Time: 23.27, Progress: 99.5
+3 :: 3732 LAP COMPLETE: Time: 23.37, Progress: 99.6
+4 :: 4667 LAP COMPLETE: Time: 23.37, Progress: 99.6
+5 :: 5599 LAP COMPLETE: Time: 23.30, Progress: 99.5
+6 :: 6530 LAP COMPLETE: Time: 23.27, Progress: 99.5
+7 :: 7466 LAP COMPLETE: Time: 23.40, Progress: 99.6
+8 :: 8396 LAP COMPLETE: Time: 23.25, Progress: 99.6
+9 :: 9331 LAP COMPLETE: Time: 23.37, Progress: 99.6
+Testing on MoscowRaceway...
+0 :: 2112 LAP COMPLETE: Time: 52.80, Progress: 99.5
+1 :: 4212 LAP COMPLETE: Time: 52.50, Progress: 99.6
+2 :: 6314 LAP COMPLETE: Time: 52.55, Progress: 99.5
+3 :: 8421 LAP COMPLETE: Time: 52.68, Progress: 99.5
+4 :: 10530 LAP COMPLETE: Time: 52.73, Progress: 99.6
+5 :: 12641 LAP COMPLETE: Time: 52.78, Progress: 99.6
+6 :: 14748 LAP COMPLETE: Time: 52.68, Progress: 99.5
+7 :: 16836 LAP COMPLETE: Time: 52.20, Progress: 99.6
+8 :: 18939 LAP COMPLETE: Time: 52.58, Progress: 99.6
+9 :: 21035 LAP COMPLETE: Time: 52.40, Progress: 99.5
+Testing on Austin...
+0 :: 2830 LAP COMPLETE: Time: 70.75, Progress: 99.5
+1 :: 5657 LAP COMPLETE: Time: 70.68, Progress: 99.5
+2 :: 7010 COLLISION: Time: 33.82, Progress: 47.7
+3 :: 9827 COLLISION: Time: 70.43, Progress: 99.5
+4 :: 12653 LAP COMPLETE: Time: 70.65, Progress: 99.5
+5 :: 14715 COLLISION: Time: 51.55, Progress: 72.7
+6 :: 16569 COLLISION: Time: 46.35, Progress: 65.3
+7 :: 17137 COLLISION: Time: 14.20, Progress: 19.4
+8 :: 17687 COLLISION: Time: 13.75, Progress: 18.6
+9 :: 18970 COLLISION: Time: 32.07, Progress: 44.5
+Testing on Spielberg...
+0 :: 2171 LAP COMPLETE: Time: 54.28, Progress: 99.5
+1 :: 4356 LAP COMPLETE: Time: 54.63, Progress: 99.5
+2 :: 4423 COLLISION: Time: 1.67, Progress: 0.5
+3 :: 6595 LAP COMPLETE: Time: 54.30, Progress: 99.5
+4 :: 8770 LAP COMPLETE: Time: 54.38, Progress: 99.6
+5 :: 10947 LAP COMPLETE: Time: 54.43, Progress: 99.6
+6 :: 13122 LAP COMPLETE: Time: 54.38, Progress: 99.5
+7 :: 15303 LAP COMPLETE: Time: 54.53, Progress: 99.5
+8 :: 17482 LAP COMPLETE: Time: 54.48, Progress: 99.5
+9 :: 19660 LAP COMPLETE: Time: 54.45, Progress: 99.6
