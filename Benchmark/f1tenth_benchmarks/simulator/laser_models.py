@@ -381,14 +381,14 @@ class ScanSimulator2D(object):
         self.set_map(map_name)
     
     def set_map(self, map_name):
-        map_path = os.getcwd()[0:-len(os.getcwd().lower().split("tinylidarnet")[-1])]+"/Benchmark/maps/" + map_name + ".yaml"
+        map_path = os.path.abspath(__file__).rpartition("/Benchmark")[0]+"/Benchmark/maps/" + map_name + ".yaml"
         
         with open(map_path, 'r') as yaml_stream:
             try:
                 map_metadata = yaml.safe_load(yaml_stream)
                 self.map_resolution = map_metadata['resolution']
                 self.origin = map_metadata['origin']
-                map_img_path = os.getcwd()[0:-len(os.getcwd().lower().split("tinylidarnet")[-1])]+"/Benchmark/maps/" + map_metadata['image']
+                map_img_path = os.path.abspath(__file__).rpartition("/Benchmark")[0]+"/Benchmark/maps/" + map_metadata['image']
             except yaml.YAMLError as ex:
                 print(ex)
 

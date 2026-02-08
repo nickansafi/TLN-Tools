@@ -2,7 +2,8 @@
 import os
 #os.environ["CUDA_VISIBLE_DEVICES"] = "-1" # If you want utilize GPU, uncomment this line
 from sklearn.utils import shuffle
-import rosbag
+from rosbags.serde import deserialize_cdr
+from rosbags.typesys import get_types_from_msg, register_types
 import time
 import subprocess
 import numpy as np

@@ -63,7 +63,7 @@ class TinyLidarNetTest:
 # Example usage:
 if __name__ == "__main__":
     # Path to your TFLite model
-    model_path = os.getcwd()[0:-len(os.getcwd().lower().split("tinylidarnet")[-1])]+"/Benchmark/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_MLP_M_noquantized.tflite"
+    model_path = os.path.abspath(__file__).rpartition("/Benchmark")[0]+"/Benchmark/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_MLP_M_noquantized.tflite"
 
     # Initialize the TinyLidarNetTest with the model path
     tiny_lidar_net = TinyLidarNetTest(model_path=model_path)
