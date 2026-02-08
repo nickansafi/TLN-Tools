@@ -159,6 +159,15 @@ Press the 'X' button on your joystick to start collecting data while the car is 
 If you have found our work useful, please consider citing:
 
 ```
-cite
+@INPROCEEDINGS{10801430,
+  author={Zarrar, Mohammed Misbah and Weng, Qitao and Yerjan, Bakhbyergyen and Soyyigit, Ahmet and Yun, Heechul},
+  booktitle={2024 IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)}, 
+  title={TinyLidarNet: 2D LiDAR-based End-to-End Deep Learning Model for F1TENTH Autonomous Racing}, 
+  year={2024},
+  volume={},
+  number={},
+  pages={2878-2884},
+  keywords={Laser radar;Quantization (signal);Navigation;Computational modeling;Computer architecture;Predictive models;Robot sensing systems;Real-time systems;Convolutional neural networks;Low latency communication},
+  doi={10.1109/IROS58592.2024.10801430}}
 ```
 
