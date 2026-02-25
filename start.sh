@@ -14,9 +14,9 @@ if [ "$1" = "setup" ]; then
     pip3 install -e .
 elif [ "$1" = "train" ]; then
     source venv/bin/activate
-    python3 $2
+    python3 $2.py
 elif [ "$1" = "benchmark" ]; then
     cd "$(dirname "$0")"/
     source venv/bin/activate
-    python3 ./Benchmark/f1tenth_benchmarks/benchmark_results/$2
+    python3 ./Benchmark/f1tenth_benchmarks/benchmark_results/$2.py
 fi

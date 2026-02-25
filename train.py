@@ -2,8 +2,8 @@
 import os
 #os.environ["CUDA_VISIBLE_DEVICES"] = "-1" # If you want utilize GPU, uncomment this line
 from sklearn.utils import shuffle
-from rosbags.serde import deserialize_cdr
-from rosbags.typesys import get_types_from_msg, register_types
+from rosbags.rosbag1 import Reader
+from rosbags.typesys import Stores, get_typestore, get_types_from_msg
 import time
 import subprocess
 import numpy as np
@@ -18,6 +18,9 @@ from tensorflow.keras.optimizers import Adam
 # os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 gpu_available = tf.test.is_gpu_available()
 print('GPU AVAILABLE:', gpu_available)
+typestore = get_typestore(Stores.ROS1_NOETIC)
+typestore.register(get_types_from_msg("float32 steering_angle\nfloat32 steering_angle_velocity\nfloat32 speed\nfloat32 acceleration\nfloat32 jerk", "ackermann_msgs/msg/AckermannDrive"))
+typestore.register(get_types_from_msg("std_msgs/Header header\nackermann_msgs/AckermannDrive drive", "ackermann_msgs/msg/AckermannDriveStamped"))
 
 #========================================================
 # Functions
@@ -75,14 +78,17 @@ for pth in dataset_path:
     if not os.path.exists(pth):
         print(f"out.bag doesn't exist in {pth}")
         exit(0)
-    good_bag = rosbag.Bag(pth)
+    good_bag = Reader(pth)
 
     lidar_data = []
     servo_data = []
     speed_data = []
 
     # Read messages from bag file
-    for topic, msg, t in good_bag.read_messages():
+    good_bag.open()
+    for connection, t, rawdata in good_bag.messages():
+        msg = typestore.deserialize_ros1(rawdata, connection.msgtype)
+        topic = connection.topic
         if topic == 'Lidar':
             ranges = msg.ranges[::down_sample_param]
             lidar_data.append(ranges)
@@ -94,6 +100,7 @@ for pth in dataset_path:
             if s_data > max_speed:
                 max_speed = s_data
             speed_data.append(s_data)
+    good_bag.close()
 
     # Convert data to arrays
     lidar_data = np.array(lidar_data) 
