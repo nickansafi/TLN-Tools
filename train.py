@@ -2,8 +2,8 @@
 import os
 #os.environ["CUDA_VISIBLE_DEVICES"] = "-1" # If you want utilize GPU, uncomment this line
 from sklearn.utils import shuffle
-from rosbags.rosbag1 import Reader
 from rosbags.typesys import Stores, get_typestore, get_types_from_msg
+import sqlite3
 import time
 import subprocess
 import numpy as np
@@ -18,7 +18,7 @@ from tensorflow.keras.optimizers import Adam
 # os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 gpu_available = tf.test.is_gpu_available()
 print('GPU AVAILABLE:', gpu_available)
-typestore = get_typestore(Stores.ROS1_NOETIC)
+typestore = get_typestore(Stores.ROS2_HUMBLE)
 typestore.register(get_types_from_msg("float32 steering_angle\nfloat32 steering_angle_velocity\nfloat32 speed\nfloat32 acceleration\nfloat32 jerk", "ackermann_msgs/msg/AckermannDrive"))
 typestore.register(get_types_from_msg("std_msgs/Header header\nackermann_msgs/AckermannDrive drive", "ackermann_msgs/msg/AckermannDriveStamped"))
 
@@ -49,13 +49,13 @@ test_servo = []
 test_speed = []
 model_name = 'TLN'
 model_files = [
-    './Models/'+model_name+'_noquantized.tflite',
-    './Models/'+model_name+'_int8.tflite'
+    './Benchmark/f1tenth_benchmarks/zarrar/'+model_name+'_noquantized.tflite',
+    './Benchmark/f1tenth_benchmarks/zarrar/'+model_name+'_int8.tflite'
 ]
 dataset_path = [
-    './Dataset/out.bag', 
-    './Dataset/f2.bag', 
-    './Dataset/f4.bag',
+    './Dataset/out/out.db3',
+    './Dataset/f2/f2.db3',
+    './Dataset/f4/f4.db3'
 ]
 loss_figure_path = './Figures/loss_curve.png'
 down_sample_param = 2 # Down-sample Lidar data
@@ -78,21 +78,26 @@ for pth in dataset_path:
     if not os.path.exists(pth):
         print(f"out.bag doesn't exist in {pth}")
         exit(0)
-    good_bag = Reader(pth)
 
     lidar_data = []
     servo_data = []
     speed_data = []
 
     # Read messages from bag file
-    good_bag.open()
-    for connection, t, rawdata in good_bag.messages():
-        msg = typestore.deserialize_ros1(rawdata, connection.msgtype)
-        topic = connection.topic
-        if topic == 'Lidar':
+    connection = sqlite3.connect(pth)
+    cursor = connection.cursor()
+    cursor.execute("SELECT topics.name, topics.type, messages.data FROM messages JOIN topics ON messages.topic_id = topics.id")
+    for topic, type, rawdata in cursor:
+        try:
+            msg = typestore.deserialize_cdr(rawdata,type)
+        except:
+            continue
+        if topic in ['Lidar', 'scan']:
+            if len(msg.ranges) != 1081:
+                continue
             ranges = msg.ranges[::down_sample_param]
             lidar_data.append(ranges)
-        if topic == 'Ackermann':
+        if topic in ['Ackermann', 'drive']:
             data = msg.drive.steering_angle
             s_data = msg.drive.speed
             
@@ -100,7 +105,9 @@ for pth in dataset_path:
             if s_data > max_speed:
                 max_speed = s_data
             speed_data.append(s_data)
-    good_bag.close()
+    connection.close()
+    if len(set([len(lidar_data),len(servo_data),len(speed_data)])) != 1:
+        continue
 
     # Convert data to arrays
     lidar_data = np.array(lidar_data) 
@@ -251,7 +258,7 @@ print(f"Servo Test Loss: {servo_test_loss}")
 # Save non-quantized model
 converter = tf.lite.TFLiteConverter.from_keras_model(model)
 tflite_model = converter.convert()
-tflite_model_path = './Models/' + model_name + "_noquantized.tflite"
+tflite_model_path = './Benchmark/f1tenth_benchmarks/zarrar/' + model_name + "_noquantized.tflite"
 with open(tflite_model_path, 'wb') as f:
     f.write(tflite_model)
     print(f"{model_name}_noquantized.tflite is saved.")
@@ -270,7 +277,7 @@ converter.representative_dataset = representative_data_gen
 converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
 quantized_tflite_model = converter.convert()
 
-tflite_model_path = './Models/' + model_name + "_int8.tflite"
+tflite_model_path = './Benchmark/f1tenth_benchmarks/zarrar/' + model_name + "_int8.tflite"
 with open(tflite_model_path, 'wb') as f:
     f.write(quantized_tflite_model)
     print(f"{model_name}_int8.tflite is saved.")

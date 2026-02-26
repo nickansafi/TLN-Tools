@@ -1,4 +1,4 @@
-if [ "$1" = "setup" ]; then
+if [ "$1" = "s" ]; then
     python3 -m venv venv
     source venv/bin/activate
     pip3 install scikit-learn
@@ -12,10 +12,10 @@ if [ "$1" = "setup" ]; then
     git submodule update
     cd trajectory_planning_helpers
     pip3 install -e .
-elif [ "$1" = "train" ]; then
+elif [ "$1" = "t" ]; then
     source venv/bin/activate
     python3 $2.py
-elif [ "$1" = "benchmark" ]; then
+elif [ "$1" = "b" ]; then
     cd "$(dirname "$0")"/
     source venv/bin/activate
     python3 ./Benchmark/f1tenth_benchmarks/benchmark_results/$2.py
