@@ -40,8 +40,13 @@ INCREMENTAL = False
 
 TEST_MODE = False  # Flip to True for single-batch pipeline test
 
-SKIP_PHASE1 = True  # If True, skip Phase 1 and run Phase 2 with a flat LR for 20 epochs
+SKIP_PHASE1 = True  # If True, skip Phase 1 and run Phase 2 with flat LR
 PHASE2_SIMPLE_EPOCHS = 20
+
+# Performance flags
+USE_MIXED_PRECISION = False  # Enable mixed_float16 (needs GPU with compute >= 7.0)
+USE_XLA = True              # Enable jit_compile on train/val steps
+SHUFFLE_BUFFER = 10000       # tf.data shuffle buffer size
 
 DATASET_ROOT = './Dataset'
 
@@ -56,8 +61,8 @@ MAX_EPOCHS = 200
 PHASE2_FILENAMES = [
     'jfr1.db3',
     'jfr2.db3',
-    'jfr5v_opp.db3',
-    'jfr6v_opp.db3',
+    'jfrv5_opp.db3',
+    'jfrv6_opp.db3',
     'Forza_GLC_smile_PP_edgecases_0.db3',
 ]
 
@@ -98,6 +103,16 @@ model_files = [
     './Benchmark/f1tenth_benchmarks/zarrar/' + model_name + '_noquantized.tflite',
     './Benchmark/f1tenth_benchmarks/zarrar/' + model_name + '_int8.tflite'
 ]
+
+#========================================================
+# Mixed Precision Setup
+#========================================================
+
+if USE_MIXED_PRECISION:
+    policy = tf.keras.mixed_precision.Policy('mixed_float16')
+    tf.keras.mixed_precision.set_global_policy(policy)
+    print(f"Mixed precision enabled: compute={policy.compute_dtype}, "
+          f"variable={policy.variable_dtype}")
 
 #========================================================
 # Helpers
@@ -203,6 +218,7 @@ def build_lr_schedule(base_lr, num_epochs, steps_per_epoch, warmup_epochs=2):
 
 #========================================================
 # Resolution-Aware Batch Normalization
+# (pure TF ops — compatible with @tf.function and XLA)
 #========================================================
 
 class ResolutionAwareBatchNormalization(tf.keras.layers.Layer):
@@ -247,47 +263,43 @@ class ResolutionAwareBatchNormalization(tf.keras.layers.Layer):
 
     def call(self, x, training=False):
         if training:
+            # idx is a Python int, captured at tf.function trace time.
+            # Each unrolled scale iteration traces with its own idx value.
             idx = self._current_scale_index
-
-            if BN_DEBUG:
-                spatial_dim = x.shape[1] if x.shape[1] is not None else '?'
-                scale = self.resolution_scales[idx]
-                print(
-                    f"  [BN] {self.name} | train | bank={idx} "
-                    f"(scale={scale}) | spatial={spatial_dim} | "
-                    f"expected={self.expected_lengths}"
-                )
 
             mean = tf.reduce_mean(x, axis=[0, 1])
             var = tf.math.reduce_variance(x, axis=[0, 1])
 
             m = self.momentum
             if m is None:
+                # Cumulative moving average (used during BN calibration)
                 count = self.all_num_batches[idx]
                 m = 1.0 / (tf.cast(count, tf.float32) + 1.0)
 
-            new_means = self.all_running_means.numpy()
-            new_vars = self.all_running_vars.numpy()
-            new_counts = self.all_num_batches.numpy()
-            new_means[idx] = new_means[idx] * (1.0 - m) + mean.numpy() * m
-            new_vars[idx] = new_vars[idx] * (1.0 - m) + var.numpy() * m
-            new_counts[idx] += 1.0
-            self.all_running_means.assign(new_means)
-            self.all_running_vars.assign(new_vars)
-            self.all_num_batches.assign(new_counts)
+            # Pure-TF running stat updates (no .numpy())
+            old_mean = self.all_running_means[idx]
+            old_var = self.all_running_vars[idx]
+            new_mean = old_mean * (1.0 - m) + mean * m
+            new_var = old_var * (1.0 - m) + var * m
+
+            self.all_running_means.assign(
+                tf.tensor_scatter_nd_update(
+                    self.all_running_means,
+                    [[idx]],
+                    tf.expand_dims(new_mean, 0)))
+            self.all_running_vars.assign(
+                tf.tensor_scatter_nd_update(
+                    self.all_running_vars,
+                    [[idx]],
+                    tf.expand_dims(new_var, 0)))
+            self.all_num_batches.assign(
+                tf.tensor_scatter_nd_update(
+                    self.all_num_batches,
+                    [[idx]],
+                    [self.all_num_batches[idx] + 1.0]))
         else:
+            # Inference: auto-detect scale from spatial dimension
             idx = self._resolve_index_from_shape(x)
-
-            if BN_DEBUG and tf.executing_eagerly():
-                spatial_dim = x.shape[1] if x.shape[1] is not None else '?'
-                idx_val = int(idx.numpy())
-                scale = self.resolution_scales[idx_val]
-                print(
-                    f"  [BN] {self.name} | infer | bank={idx_val} "
-                    f"(scale={scale}) | spatial={spatial_dim} | "
-                    f"expected={self.expected_lengths}"
-                )
-
             mean = tf.gather(self.all_running_means, idx)
             var = tf.gather(self.all_running_vars, idx)
 
@@ -317,7 +329,7 @@ def set_model_resolution(model, scale_index):
 
 
 #========================================================
-# BN Calibration
+# BN Calibration (runs eagerly — not performance-critical)
 #========================================================
 
 def calibrate_batch_norm(model, lidar_data, resolution_scales,
@@ -433,19 +445,20 @@ def prepare_split(lidar, servo, speed, max_speed, min_speed=0,
 
 
 #========================================================
-# Training Loop (one phase) with early stopping
+# Training Loop (one phase) — tf.data + @tf.function
 #========================================================
 
 def run_training_phase(model, data, max_epochs, base_lr, batch_size,
                        warmup_epochs, patience, min_delta,
                        phase_name="Phase"):
-    """Multi-resolution training with warmup + cosine decay and
-    early stopping based on average validation loss.
-
-    Stops when val loss hasn't improved by at least min_delta
-    for `patience` consecutive epochs. Restores the best weights.
+    """Multi-resolution training with:
+      - Precomputed per-scale data
+      - tf.data pipelines with shuffle / batch / prefetch
+      - @tf.function-compiled train and val steps
+      - Optional XLA (jit_compile) and mixed precision
+      - Warmup + cosine decay LR schedule
+      - Early stopping with best-weight restore
     """
-    global BN_DEBUG
 
     train_lidar = data['train_lidar']
     train_labels = data['train_labels']
@@ -454,17 +467,102 @@ def run_training_phase(model, data, max_epochs, base_lr, batch_size,
 
     effective_max = 1 if TEST_MODE else max_epochs
 
+    # ------------------------------------------------------------------
+    # 1) Precompute resized arrays for every scale (done once in NumPy)
+    # ------------------------------------------------------------------
+    print(f"  Precomputing resized data for {len(RESOLUTION_SCALES)} scales...")
+    train_per_scale = []
+    test_per_scale = []
+    for scale in RESOLUTION_SCALES:
+        tr = resize_lidar_1d(train_lidar, scale)
+        train_per_scale.append(np.expand_dims(tr, -1).astype(np.float32))
+        te = resize_lidar_1d(test_lidar, scale)
+        test_per_scale.append(np.expand_dims(te, -1).astype(np.float32))
+
+    train_labels_f32 = train_labels.astype(np.float32)
+    test_labels_f32 = test_labels.astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # 2) Build tf.data pipelines
+    # ------------------------------------------------------------------
+    # Training: yields (scale0_batch, scale1_batch, ..., labels)
+    train_ds = tf.data.Dataset.from_tensor_slices(
+        tuple(train_per_scale) + (train_labels_f32,))
+    train_ds = (train_ds
+                .shuffle(min(len(train_lidar), SHUFFLE_BUFFER))
+                .batch(batch_size, drop_remainder=True)
+                .prefetch(tf.data.AUTOTUNE))
+
+    # Validation: one dataset per scale → (x_batch, y_batch)
+    val_datasets = []
+    for i in range(len(RESOLUTION_SCALES)):
+        vds = tf.data.Dataset.from_tensor_slices(
+            (test_per_scale[i], test_labels_f32))
+        vds = vds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+        val_datasets.append(vds)
+
+    # ------------------------------------------------------------------
+    # 3) Optimizer + schedule
+    # ------------------------------------------------------------------
     steps_per_epoch = max(1, len(train_lidar) // batch_size)
     schedule = build_lr_schedule(
         base_lr, effective_max, steps_per_epoch, warmup_epochs)
     optimizer = Adam(learning_rate=schedule)
-    loss_fn = tf.keras.losses.Huber()
 
+    if USE_MIXED_PRECISION:
+        optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
+
+    loss_fn = tf.keras.losses.Huber()
+    num_scales_f = float(len(RESOLUTION_SCALES))
+
+    # ------------------------------------------------------------------
+    # 4) Compiled train step
+    #    The Python for-loop over scales is UNROLLED at trace time,
+    #    so each scale gets its own subgraph with the correct BN index.
+    # ------------------------------------------------------------------
+    @tf.function(jit_compile=USE_XLA)
+    def train_step(*args):
+        labels = args[-1]
+        scale_batches = args[:-1]
+
+        with tf.GradientTape() as tape:
+            total_loss = tf.constant(0.0)
+            for scale_idx, s_batch in enumerate(scale_batches):
+                set_model_resolution(model, scale_idx)
+                preds = model(s_batch, training=True)
+                total_loss = total_loss + tf.reduce_mean(
+                    loss_fn(labels, preds))
+            avg_loss = total_loss / num_scales_f
+
+            if USE_MIXED_PRECISION:
+                scaled_loss = optimizer.get_scaled_loss(avg_loss)
+
+        if USE_MIXED_PRECISION:
+            grads = tape.gradient(scaled_loss, model.trainable_variables)
+            grads = optimizer.get_unscaled_gradients(grads)
+        else:
+            grads = tape.gradient(avg_loss, model.trainable_variables)
+
+        optimizer.apply_gradients(zip(grads, model.trainable_variables))
+        return avg_loss
+
+    # ------------------------------------------------------------------
+    # 5) Compiled val step
+    #    Different input shapes (per scale) cause separate traces,
+    #    each capturing the correct BN index via _resolve_index_from_shape.
+    # ------------------------------------------------------------------
+    @tf.function
+    def val_step(x_batch, y_batch):
+        preds = model(x_batch, training=False)
+        return tf.reduce_mean(loss_fn(y_batch, preds))
+
+    # ------------------------------------------------------------------
+    # 6) Training loop
+    # ------------------------------------------------------------------
     history_train = []
     history_val = []
     history_val_per_res = defaultdict(list)
 
-    # Early stopping state
     best_val_loss = float('inf')
     best_weights = None
     epochs_without_improvement = 0
@@ -475,61 +573,26 @@ def run_training_phase(model, data, max_epochs, base_lr, batch_size,
     if TEST_MODE:
         print(f" *** TEST MODE: 1 epoch, 1 batch only ***")
     print(f" {len(train_lidar)} train / {len(test_lidar)} test samples")
-    print(f" Warmup: {warmup_epochs} epochs ({warmup_epochs * steps_per_epoch} steps)")
+    print(f" Warmup: {warmup_epochs} epochs "
+          f"({warmup_epochs * steps_per_epoch} steps)")
     print(f" Steps/epoch: {steps_per_epoch}, "
           f"max total: {effective_max * steps_per_epoch}")
+    print(f" tf.data + @tf.function enabled | "
+          f"XLA={USE_XLA} | mixed_prec={USE_MIXED_PRECISION}")
     print(f"{'='*60}\n")
 
     phase_start = time.time()
 
     for epoch in range(effective_max):
         epoch_start = time.time()
-        perm = np.random.permutation(len(train_lidar))
-        lidar_shuf = train_lidar[perm]
-        labels_shuf = train_labels[perm]
 
         epoch_loss = 0.0
         num_batches = 0
-        show_debug = BN_DEBUG and epoch == 0
 
-        for start in range(0, len(lidar_shuf) - batch_size + 1, batch_size):
-            lidar_batch = lidar_shuf[start:start + batch_size]
-            label_batch = labels_shuf[start:start + batch_size]
-            label_tensor = tf.constant(label_batch, dtype=tf.float32)
-
-            first_batch = show_debug and num_batches == 0
-
-            with tf.GradientTape() as tape:
-                total_loss = 0.0
-                for scale_idx, scale in enumerate(RESOLUTION_SCALES):
-                    set_model_resolution(model, scale_idx)
-                    resized = resize_lidar_1d(lidar_batch, scale)
-                    resized = np.expand_dims(resized, -1).astype(np.float32)
-
-                    if first_batch:
-                        print(f"  Scale {scale}x (bank {scale_idx}), "
-                              f"input shape {resized.shape}:")
-
-                    preds = model(resized, training=True)
-                    total_loss += tf.reduce_mean(loss_fn(label_tensor, preds))
-
-                avg_loss = total_loss / len(RESOLUTION_SCALES)
-
-            grads = tape.gradient(avg_loss, model.trainable_variables)
-            optimizer.apply_gradients(zip(grads, model.trainable_variables))
-
-            if first_batch:
-                BN_DEBUG = False
-
-            epoch_loss += float(avg_loss)
+        for batch_data in train_ds:
+            loss = train_step(*batch_data)
+            epoch_loss += float(loss)
             num_batches += 1
-
-            if (num_batches % 100 == 0 or num_batches == 1) and INCREMENTAL:
-                current_step = (epoch * steps_per_epoch) + num_batches
-                current_lr = float(schedule(current_step))
-                print(
-                    f'    batch {num_batches}/{steps_per_epoch} '
-                    f'loss:{float(avg_loss):.4f} lr:{current_lr:.2e}')
 
             if TEST_MODE:
                 print(f"  [TEST MODE] Trained 1 batch, stopping epoch.")
@@ -540,20 +603,14 @@ def run_training_phase(model, data, max_epochs, base_lr, batch_size,
         # Per-resolution validation
         val_losses = {}
         for scale_idx, scale in enumerate(RESOLUTION_SCALES):
-            set_model_resolution(model, scale_idx)
-            resized_test = resize_lidar_1d(test_lidar, scale)
-            resized_test = np.expand_dims(resized_test, -1).astype(np.float32)
-
-            val_preds = []
-            for vstart in range(0, len(resized_test), batch_size):
-                vbatch = resized_test[vstart:vstart + batch_size]
-                vp = model(vbatch, training=False)
-                val_preds.append(vp.numpy())
+            total_val = 0.0
+            n_val = 0
+            for x_batch, y_batch in val_datasets[scale_idx]:
+                total_val += float(val_step(x_batch, y_batch))
+                n_val += 1
                 if TEST_MODE:
                     break
-            val_preds = np.concatenate(val_preds, axis=0)
-            val_losses[scale] = float(tf.reduce_mean(
-                loss_fn(test_labels[:len(val_preds)], val_preds)))
+            val_losses[scale] = total_val / max(n_val, 1)
 
         avg_val = sum(val_losses.values()) / len(val_losses)
 
@@ -572,7 +629,7 @@ def run_training_phase(model, data, max_epochs, base_lr, batch_size,
             best_val_loss = avg_val
             best_weights = [w.numpy() for w in model.trainable_variables]
             epochs_without_improvement = 0
-            marker = " *"  # mark best epoch
+            marker = " *"
         else:
             epochs_without_improvement += 1
             marker = ""
@@ -610,14 +667,16 @@ def run_training_phase(model, data, max_epochs, base_lr, batch_size,
 
 if not SKIP_PHASE1:
     print("\n========== Loading Phase 1 (all .db3 except Phase 2) ==========")
-    p1_lidar, p1_servo, p1_speed, p1_max = load_dataset(PHASE1_PATHS, down_sample_param)
+    p1_lidar, p1_servo, p1_speed, p1_max = load_dataset(
+        PHASE1_PATHS, down_sample_param)
     print(f"Phase 1 total: {len(p1_lidar)} samples, max_speed={p1_max:.2f}")
 else:
     print("\n========== SKIP_PHASE1=True — skipping Phase 1 data load ==========")
     p1_max = 0.0
 
 print("\n========== Loading Phase 2 (selected files) ==========")
-p2_lidar, p2_servo, p2_speed, p2_max = load_dataset(PHASE2_PATHS, down_sample_param)
+p2_lidar, p2_servo, p2_speed, p2_max = load_dataset(
+    PHASE2_PATHS, down_sample_param)
 print(f"Phase 2 total: {len(p2_lidar)} samples, max_speed={p2_max:.2f}")
 
 global_max_speed = max(p1_max, p2_max)
@@ -636,14 +695,20 @@ if not SKIP_PHASE1:
     assert phase1_data['train_lidar'].shape[1] == num_lidar_range_values
 print(f'num_lidar_range_values: {num_lidar_range_values}')
 for s in RESOLUTION_SCALES:
-    print(f'  Scale {s:.2f}x -> {int(round(num_lidar_range_values * s))} input points')
+    print(f'  Scale {s:.2f}x -> '
+          f'{int(round(num_lidar_range_values * s))} input points')
 
 #======================================================
 # Build Model
 #======================================================
 
+# With mixed precision the final layer must output float32 for numeric
+# stability; all other layers follow the global policy automatically.
+output_dtype = 'float32' if USE_MIXED_PRECISION else None
+
 model = tf.keras.Sequential([
-    tf.keras.layers.Conv1D(24, 10, strides=4, activation='relu', input_shape=(None, 1)),
+    tf.keras.layers.Conv1D(
+        24, 10, strides=4, activation='relu', input_shape=(None, 1)),
     ResolutionAwareBatchNormalization(RESOLUTION_SCALES, name='rabn_1'),
 
     tf.keras.layers.Conv1D(36, 8, strides=4, activation='relu'),
@@ -663,7 +728,7 @@ model = tf.keras.Sequential([
     tf.keras.layers.Dense(100, activation='relu'),
     tf.keras.layers.Dense(50, activation='relu'),
     tf.keras.layers.Dense(10, activation='relu'),
-    tf.keras.layers.Dense(2, activation='tanh'),
+    tf.keras.layers.Dense(2, activation='tanh', dtype=output_dtype),
 ])
 
 model(np.zeros((1, num_lidar_range_values, 1), dtype=np.float32))
@@ -780,6 +845,10 @@ print("\n==========================================")
 print("TFLite Export")
 print("==========================================")
 
+# Ensure export runs in float32 regardless of training policy
+if USE_MIXED_PRECISION:
+    tf.keras.mixed_precision.set_global_policy('float32')
+
 @tf.function(input_signature=[
     tf.TensorSpec([1, None, 1], tf.float32, name='lidar'),
 ])
@@ -881,9 +950,11 @@ for m_name in model_files:
     if not os.path.exists(m_name):
         print(f"Skipping {m_name} (not found)")
         continue
-    y_pred, inf_times = evaluate_model(m_name, test_lidar_final, test_labels_final)
+    y_pred, inf_times = evaluate_model(
+        m_name, test_lidar_final, test_labels_final)
     all_inference_times_micros.append(inf_times)
-    print(f'Huber Loss for {m_name}: {huber_loss(test_labels_final, y_pred)}\n')
+    print(f'Huber Loss for {m_name}: '
+          f'{huber_loss(test_labels_final, y_pred)}\n')
 
 if all_inference_times_micros:
     plt.figure()
