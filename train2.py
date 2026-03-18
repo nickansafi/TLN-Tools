@@ -53,8 +53,8 @@ MAX_EPOCHS = 200
 PHASE2_FILENAMES = [
     'jfr1.db3',
     'jfr2.db3',
-    'jfr5_opp.db3',
-    'jfr6_opp.db3',
+    'jfr5v_opp.db3',
+    'jfr6v_opp.db3',
     'Forza_GLC_smile_PP_edgecases_0.db3',
 ]
 
