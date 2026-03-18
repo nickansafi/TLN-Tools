@@ -220,17 +220,17 @@ class ResolutionAwareBatchNormalization(tf.keras.layers.Layer):
     def build(self, input_shape):
         nf = input_shape[-1]
         self.gamma = self.add_weight(
-            'gamma', shape=(nf,), initializer='ones', trainable=True)
+            name='gamma', shape=(nf,), initializer='ones', trainable=True)
         self.beta = self.add_weight(
-            'beta', shape=(nf,), initializer='zeros', trainable=True)
+            name='beta', shape=(nf,), initializer='zeros', trainable=True)
         self.all_running_means = self.add_weight(
-            'all_running_means', shape=(self.num_scales, nf),
+            name='all_running_means', shape=(self.num_scales, nf),
             initializer='zeros', trainable=False)
         self.all_running_vars = self.add_weight(
-            'all_running_vars', shape=(self.num_scales, nf),
+            name='all_running_vars', shape=(self.num_scales, nf),
             initializer='ones', trainable=False)
         self.all_num_batches = self.add_weight(
-            'all_num_batches', shape=(self.num_scales,),
+            name='all_num_batches', shape=(self.num_scales,),
             initializer='zeros', dtype=tf.float32, trainable=False)
         super().build(input_shape)
 
@@ -521,7 +521,7 @@ def run_training_phase(model, data, max_epochs, base_lr, batch_size,
             epoch_loss += float(avg_loss)
             num_batches += 1
 
-            if num_batches % 100 == 0 or num_batches == 1 and INCREMENTAL:
+            if (num_batches % 100 == 0 or num_batches == 1) and INCREMENTAL:
                 current_step = (epoch * steps_per_epoch) + num_batches
                 current_lr = float(schedule(current_step))
                 print(
