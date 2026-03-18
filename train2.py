@@ -40,6 +40,9 @@ INCREMENTAL = False
 
 TEST_MODE = False  # Flip to True for single-batch pipeline test
 
+SKIP_PHASE1 = True  # If True, skip Phase 1 and run Phase 2 with a flat LR for 20 epochs
+PHASE2_SIMPLE_EPOCHS = 20
+
 DATASET_ROOT = './Dataset'
 
 # Early stopping: stop if val loss doesn't improve for this many epochs
@@ -605,9 +608,13 @@ def run_training_phase(model, data, max_epochs, base_lr, batch_size,
 # Load datasets
 #========================================================
 
-print("\n========== Loading Phase 1 (all .db3 except Phase 2) ==========")
-p1_lidar, p1_servo, p1_speed, p1_max = load_dataset(PHASE1_PATHS, down_sample_param)
-print(f"Phase 1 total: {len(p1_lidar)} samples, max_speed={p1_max:.2f}")
+if not SKIP_PHASE1:
+    print("\n========== Loading Phase 1 (all .db3 except Phase 2) ==========")
+    p1_lidar, p1_servo, p1_speed, p1_max = load_dataset(PHASE1_PATHS, down_sample_param)
+    print(f"Phase 1 total: {len(p1_lidar)} samples, max_speed={p1_max:.2f}")
+else:
+    print("\n========== SKIP_PHASE1=True — skipping Phase 1 data load ==========")
+    p1_max = 0.0
 
 print("\n========== Loading Phase 2 (selected files) ==========")
 p2_lidar, p2_servo, p2_speed, p2_max = load_dataset(PHASE2_PATHS, down_sample_param)
@@ -617,11 +624,16 @@ global_max_speed = max(p1_max, p2_max)
 global_min_speed = 0
 print(f"\nGlobal speed range: [{global_min_speed}, {global_max_speed:.2f}]")
 
-phase1_data = prepare_split(p1_lidar, p1_servo, p1_speed, global_max_speed)
+if not SKIP_PHASE1:
+    phase1_data = prepare_split(p1_lidar, p1_servo, p1_speed, global_max_speed)
+else:
+    phase1_data = None
+
 phase2_data = prepare_split(p2_lidar, p2_servo, p2_speed, global_max_speed)
 
-num_lidar_range_values = phase1_data['train_lidar'].shape[1]
-assert phase2_data['train_lidar'].shape[1] == num_lidar_range_values
+num_lidar_range_values = phase2_data['train_lidar'].shape[1]
+if not SKIP_PHASE1:
+    assert phase1_data['train_lidar'].shape[1] == num_lidar_range_values
 print(f'num_lidar_range_values: {num_lidar_range_values}')
 for s in RESOLUTION_SCALES:
     print(f'  Scale {s:.2f}x -> {int(round(num_lidar_range_values * s))} input points')
@@ -663,22 +675,32 @@ print(model.summary())
 # Phase 1: Train on all .db3 EXCEPT Phase 2 files
 #======================================================
 
-p1_train, p1_val, p1_val_res = run_training_phase(
-    model, phase1_data, MAX_EPOCHS, lr, batch_size, warmup_epochs,
-    PATIENCE, MIN_DELTA,
-    phase_name="Phase 1 (general)",
-)
+if SKIP_PHASE1:
+    print("\n*** SKIP_PHASE1=True — skipping Phase 1 training ***")
+    p1_train, p1_val, p1_val_res = [], [], {}
+else:
+    p1_train, p1_val, p1_val_res = run_training_phase(
+        model, phase1_data, MAX_EPOCHS, lr, batch_size, warmup_epochs,
+        PATIENCE, MIN_DELTA,
+        phase_name="Phase 1 (general)",
+    )
 
 #======================================================
-# Phase 2: Train on selected files — fresh schedule,
-# same base LR, full warmup + decay cycle
+# Phase 2: Train on selected files
 #======================================================
 
-p2_train, p2_val, p2_val_res = run_training_phase(
-    model, phase2_data, MAX_EPOCHS, lr, batch_size, warmup_epochs,
-    PATIENCE, MIN_DELTA,
-    phase_name="Phase 2 (selected)",
-)
+if SKIP_PHASE1:
+    p2_train, p2_val, p2_val_res = run_training_phase(
+        model, phase2_data, PHASE2_SIMPLE_EPOCHS, lr, batch_size,
+        warmup_epochs=0, patience=PHASE2_SIMPLE_EPOCHS, min_delta=0,
+        phase_name="Phase 2 (simple)",
+    )
+else:
+    p2_train, p2_val, p2_val_res = run_training_phase(
+        model, phase2_data, MAX_EPOCHS, lr, batch_size, warmup_epochs,
+        PATIENCE, MIN_DELTA,
+        phase_name="Phase 2 (selected)",
+    )
 
 #======================================================
 # BN Calibration (on Phase 2 data — the fine-tuning set)
@@ -696,14 +718,19 @@ if CALIBRATE_BN:
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
-ax1.set_title(f'Phase 1 (general) — {len(p1_train)} epochs')
-ax1.plot(p1_train, label='Train')
-ax1.plot(p1_val, label='Val (avg)', linewidth=2)
-for s in RESOLUTION_SCALES:
-    ax1.plot(p1_val_res[s], label=f'Val {s:.2f}x', linestyle='--')
-ax1.set_xlabel('Epoch')
-ax1.set_ylabel('Loss')
-ax1.legend()
+if p1_train:
+    ax1.set_title(f'Phase 1 (general) — {len(p1_train)} epochs')
+    ax1.plot(p1_train, label='Train')
+    ax1.plot(p1_val, label='Val (avg)', linewidth=2)
+    for s in RESOLUTION_SCALES:
+        ax1.plot(p1_val_res[s], label=f'Val {s:.2f}x', linestyle='--')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.legend()
+else:
+    ax1.set_title('Phase 1 — skipped')
+    ax1.text(0.5, 0.5, 'Skipped', ha='center', va='center',
+             transform=ax1.transAxes, fontsize=14, color='gray')
 
 ax2.set_title(f'Phase 2 (selected) — {len(p2_train)} epochs')
 ax2.plot(p2_train, label='Train')
