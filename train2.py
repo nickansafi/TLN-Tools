@@ -1,5 +1,6 @@
 #Requirement Library
 import os
+import glob
 from collections import defaultdict
 from sklearn.utils import shuffle
 from rosbags.typesys import Stores, get_typestore, get_types_from_msg
@@ -34,6 +35,66 @@ RESOLUTION_SCALES = [1.0, 0.75]
 CALIBRATE_BN = True
 CALIBRATION_MAX_BATCHES = 200
 BN_DEBUG = True
+MATCH = False
+INCREMENTAL = False
+
+TEST_MODE = False  # Flip to True for single-batch pipeline test
+
+DATASET_ROOT = './Dataset'
+
+# Early stopping: stop if val loss doesn't improve for this many epochs
+PATIENCE = 5
+# Minimum improvement to count as "better"
+MIN_DELTA = 1e-5
+# Maximum epochs per phase (acts as a safety cap)
+MAX_EPOCHS = 200
+
+# Phase 2: these specific files only
+PHASE2_FILENAMES = [
+    'jfr1.db3',
+    'jfr2.db3',
+    'jfr5_opp.db3',
+    'jfr6_opp.db3',
+    'Forza_GLC_smile_PP_edgecases_0.db3',
+]
+
+# Find phase 2 files by searching anywhere under Dataset/
+ALL_DB3 = sorted(glob.glob(os.path.join(DATASET_ROOT, '**', '*.db3'), recursive=True))
+
+PHASE2_PATHS = []
+for db3_path in ALL_DB3:
+    if os.path.basename(db3_path) in PHASE2_FILENAMES:
+        PHASE2_PATHS.append(db3_path)
+
+# Check that we found all of them
+found_names = {os.path.basename(p) for p in PHASE2_PATHS}
+missing = set(PHASE2_FILENAMES) - found_names
+if missing:
+    print(f"WARNING: Phase 2 files not found: {missing}")
+
+# Phase 1: everything else (mutually exclusive)
+phase2_abs = {os.path.abspath(p) for p in PHASE2_PATHS}
+PHASE1_PATHS = [p for p in ALL_DB3 if os.path.abspath(p) not in phase2_abs]
+
+print(f"Phase 1 datasets ({len(PHASE1_PATHS)}) — excludes Phase 2:")
+for p in PHASE1_PATHS:
+    print(f"  {p}")
+print(f"Phase 2 datasets ({len(PHASE2_PATHS)}):")
+for p in PHASE2_PATHS:
+    print(f"  {p}")
+
+loss_figure_path = './Figures/loss_curve.png'
+down_sample_param = 1
+lr = 5e-5
+batch_size = 64
+warmup_epochs = 2
+hz = 40
+
+model_name = 'TLN'
+model_files = [
+    './Benchmark/f1tenth_benchmarks/zarrar/' + model_name + '_noquantized.tflite',
+    './Benchmark/f1tenth_benchmarks/zarrar/' + model_name + '_int8.tflite'
+]
 
 #========================================================
 # Helpers
@@ -44,8 +105,6 @@ def compute_conv_output_length(length, kernel_size, stride):
 
 
 def get_bn_native_lengths(model, input_length):
-    """Compute the spatial dim each BN layer sees by walking
-    the model's Conv1D and BN layers in order."""
     lengths = []
     length = input_length
     for layer in model.layers:
@@ -58,8 +117,6 @@ def get_bn_native_lengths(model, input_length):
 
 
 def patch_bn_native_lengths(model, input_length):
-    """Extract conv configs from the model and patch each BN layer's
-    native_length and expected_lengths in place."""
     bn_native_lengths = get_bn_native_lengths(model, input_length)
     bn_layers = [l for l in model.layers
                  if isinstance(l, ResolutionAwareBatchNormalization)]
@@ -101,6 +158,44 @@ def huber_loss(y_true, y_pred, delta=1.0):
     error = np.abs(y_true - y_pred)
     loss = np.where(error <= delta, 0.5 * error**2, delta * (error - 0.5 * delta))
     return np.mean(loss)
+
+
+#========================================================
+# Learning Rate Schedule
+#========================================================
+
+class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """Linear warmup then cosine decay to zero."""
+
+    def __init__(self, base_lr, warmup_steps, total_steps):
+        super().__init__()
+        self.base_lr = base_lr
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        warmup = tf.cast(self.warmup_steps, tf.float32)
+        total = tf.cast(self.total_steps, tf.float32)
+
+        warmup_lr = self.base_lr * (step / tf.maximum(warmup, 1.0))
+        progress = (step - warmup) / tf.maximum(total - warmup, 1.0)
+        cosine_lr = self.base_lr * 0.5 * (1.0 + tf.cos(np.pi * progress))
+
+        return tf.where(step < warmup, warmup_lr, cosine_lr)
+
+    def get_config(self):
+        return {
+            'base_lr': self.base_lr,
+            'warmup_steps': self.warmup_steps,
+            'total_steps': self.total_steps,
+        }
+
+
+def build_lr_schedule(base_lr, num_epochs, steps_per_epoch, warmup_epochs=2):
+    warmup_steps = warmup_epochs * steps_per_epoch
+    total_steps = num_epochs * steps_per_epoch
+    return WarmupCosineDecay(base_lr, warmup_steps, total_steps)
 
 
 #========================================================
@@ -256,155 +351,285 @@ def calibrate_batch_norm(model, lidar_data, resolution_scales,
 
 
 #========================================================
-# Global Data
+# Dataset Loading
 #========================================================
 
-lidar = []
-servo = []
-speed = []
-test_lidar = []
-test_servo = []
-test_speed = []
-model_name = 'TLN'
-model_files = [
-    './Benchmark/f1tenth_benchmarks/zarrar/' + model_name + '_noquantized.tflite',
-    './Benchmark/f1tenth_benchmarks/zarrar/' + model_name + '_int8.tflite'
-]
-dataset_path = [
-    './Dataset/out/out.db3',
-    './Dataset/f2/f2.db3',
-    './Dataset/f4/f4.db3'
-]
-loss_figure_path = './Figures/loss_curve.png'
-down_sample_param = 1
-lr = 5e-5
-loss_function = 'huber'
-batch_size = 64
-num_epochs = 20
-hz = 40
+def load_dataset(db3_paths, down_sample_param=1):
+    """Load lidar/servo/speed from a list of .db3 files."""
+    all_lidar = []
+    all_servo = []
+    all_speed = []
+    max_speed_seen = 0.0
 
-max_speed = 0
-min_speed = 0
-
-#========================================================
-# Get Dataset
-#========================================================
-
-for pth in dataset_path:
-    if not os.path.exists(pth):
-        print(f"out.bag doesn't exist in {pth}")
-        exit(0)
-
-    lidar_data = []
-    servo_data = []
-    speed_data = []
-
-    connection = sqlite3.connect(pth)
-    cursor = connection.cursor()
-    cursor.execute(
-        "SELECT topics.name, topics.type, messages.data "
-        "FROM messages JOIN topics ON messages.topic_id = topics.id"
-    )
-    for topic, type, rawdata in cursor:
-        try:
-            msg = typestore.deserialize_cdr(rawdata, type)
-        except:
+    for pth in db3_paths:
+        if not os.path.exists(pth):
+            print(f"  WARNING: {pth} not found, skipping")
             continue
-        if topic in ['Lidar', 'scan']:
-            if len(msg.ranges) != 1081:
+
+        lidar_data = []
+        servo_data = []
+        speed_data = []
+
+        connection = sqlite3.connect(pth)
+        cursor = connection.cursor()
+        cursor.execute(
+            "SELECT topics.name, topics.type, messages.data "
+            "FROM messages JOIN topics ON messages.topic_id = topics.id"
+        )
+        for topic, msg_type, rawdata in cursor:
+            try:
+                msg = typestore.deserialize_cdr(rawdata, msg_type)
+            except Exception:
                 continue
-            ranges = msg.ranges[::down_sample_param]
-            lidar_data.append(ranges)
-        if topic in ['Ackermann', 'drive']:
-            data = msg.drive.steering_angle
-            s_data = msg.drive.speed
-            servo_data.append(data)
-            if s_data > max_speed:
-                max_speed = s_data
-            speed_data.append(s_data)
-    connection.close()
-    if len(set([len(lidar_data), len(servo_data), len(speed_data)])) != 1:
-        continue
+            if topic in ['Lidar', 'scan']:
+                if len(msg.ranges) != 1081 and MATCH:
+                    continue
+                ranges = msg.ranges[:1080][::down_sample_param]
+                lidar_data.append(ranges)
+            if topic in ['Ackermann', 'drive']:
+                servo_data.append(msg.drive.steering_angle)
+                s = msg.drive.speed
+                speed_data.append(s)
+                if s > max_speed_seen:
+                    max_speed_seen = s
+        connection.close()
 
-    lidar_data = np.array(lidar_data)
-    servo_data = np.array(servo_data)
-    speed_data = np.array(speed_data)
+        if len(set([len(lidar_data), len(servo_data), len(speed_data)])) != 1:
+            print(f"  WARNING: mismatched lengths in {pth}, skipping")
+            continue
 
-    shuffled_data = shuffle(
-        np.concatenate((servo_data[:, np.newaxis], speed_data[:, np.newaxis]), axis=1),
-        random_state=62,
+        all_lidar.extend(lidar_data)
+        all_servo.extend(servo_data)
+        all_speed.extend(speed_data)
+        print(f"  Loaded {len(lidar_data)} samples from {pth}")
+
+    return (
+        np.asarray(all_lidar),
+        np.asarray(all_servo),
+        np.asarray(all_speed),
+        max_speed_seen,
     )
-    shuffled_lidar_data = shuffle(lidar_data, random_state=62)
 
-    train_ratio = 0.85
-    train_samples = int(train_ratio * len(shuffled_lidar_data))
-    x_train_bag = shuffled_lidar_data[:train_samples]
-    x_test_bag = shuffled_lidar_data[train_samples:]
 
-    y_train_bag = shuffled_data[:train_samples]
-    y_test_bag = shuffled_data[train_samples:]
+def prepare_split(lidar, servo, speed, max_speed, min_speed=0,
+                  train_ratio=0.85, seed=62):
+    """Shuffle, normalize speed, train/test split."""
+    speed_norm = linear_map(speed, min_speed, max_speed, 0, 1)
+    labels = np.stack([servo, speed_norm], axis=1)
 
-    lidar.extend(x_train_bag)
-    servo.extend(y_train_bag[:, 0])
-    speed.extend(y_train_bag[:, 1])
+    lidar_shuf = shuffle(lidar, random_state=seed)
+    labels_shuf = shuffle(labels, random_state=seed)
 
-    test_lidar.extend(x_test_bag)
-    test_servo.extend(y_test_bag[:, 0])
-    test_speed.extend(y_test_bag[:, 1])
+    n_train = int(train_ratio * len(lidar_shuf))
+    return {
+        'train_lidar': lidar_shuf[:n_train],
+        'train_labels': labels_shuf[:n_train],
+        'test_lidar': lidar_shuf[n_train:],
+        'test_labels': labels_shuf[n_train:],
+    }
 
-    print(f'\nData in {pth}:')
-    print(f'Shape of Train Data --- Lidar: {len(lidar)}, Servo: {len(servo)}, '
-          f'Speed: {len(speed)}')
-    print(f'Shape of Test Data --- Lidar: {len(test_lidar)}, '
-          f'Servo: {len(test_servo)}, Speed: {len(test_speed)}')
 
-total_number_samples = len(lidar)
-print(f'Overall Samples = {total_number_samples}')
+#========================================================
+# Training Loop (one phase) with early stopping
+#========================================================
 
-lidar = np.asarray(lidar)
-servo = np.asarray(servo)
-speed = np.asarray(speed)
-speed = linear_map(speed, min_speed, max_speed, 0, 1)
-test_lidar = np.asarray(test_lidar)
-test_servo = np.asarray(test_servo)
-test_speed = np.asarray(test_speed)
-test_speed = linear_map(test_speed, min_speed, max_speed, 0, 1)
+def run_training_phase(model, data, max_epochs, base_lr, batch_size,
+                       warmup_epochs, patience, min_delta,
+                       phase_name="Phase"):
+    """Multi-resolution training with warmup + cosine decay and
+    early stopping based on average validation loss.
 
-print(f'Min_speed: {min_speed}')
-print(f'Max_speed: {max_speed}')
-print(f'Loaded {len(lidar)} Training samples '
-      f'---- {(len(lidar)/total_number_samples)*100:0.2f}% of overall')
-print(f'Loaded {len(test_lidar)} Testing samples '
-      f'---- {(len(test_lidar)/total_number_samples)*100:0.2f}% of overall\n')
+    Stops when val loss hasn't improved by at least min_delta
+    for `patience` consecutive epochs. Restores the best weights.
+    """
+    global BN_DEBUG
 
-assert len(lidar) == len(servo) == len(speed)
-assert len(test_lidar) == len(test_servo) == len(test_speed)
+    train_lidar = data['train_lidar']
+    train_labels = data['train_labels']
+    test_lidar = data['test_lidar']
+    test_labels = data['test_labels']
 
-#======================================================
-# Split Dataset
-#======================================================
+    effective_max = 1 if TEST_MODE else max_epochs
 
-print('Splitting Data into Train/Test')
-train_data = np.concatenate(
-    (servo[:, np.newaxis], speed[:, np.newaxis]), axis=1)
-test_data = np.concatenate(
-    (test_servo[:, np.newaxis], test_speed[:, np.newaxis]), axis=1)
-print(f'Train Data(lidar): {lidar.shape}')
-print(f'Train Data(servo, speed): {servo.shape}, {speed.shape}')
-print(f'Test Data(lidar): {test_lidar.shape}')
-print(f'Test Data(servo, speed): {test_servo.shape}, {test_speed.shape}')
+    steps_per_epoch = max(1, len(train_lidar) // batch_size)
+    schedule = build_lr_schedule(
+        base_lr, effective_max, steps_per_epoch, warmup_epochs)
+    optimizer = Adam(learning_rate=schedule)
+    loss_fn = tf.keras.losses.Huber()
+
+    history_train = []
+    history_val = []
+    history_val_per_res = defaultdict(list)
+
+    # Early stopping state
+    best_val_loss = float('inf')
+    best_weights = None
+    epochs_without_improvement = 0
+
+    print(f"\n{'='*60}")
+    print(f" {phase_name}: up to {effective_max} epochs, base_lr={base_lr:.2e}")
+    print(f" Early stopping: patience={patience}, min_delta={min_delta:.1e}")
+    if TEST_MODE:
+        print(f" *** TEST MODE: 1 epoch, 1 batch only ***")
+    print(f" {len(train_lidar)} train / {len(test_lidar)} test samples")
+    print(f" Warmup: {warmup_epochs} epochs ({warmup_epochs * steps_per_epoch} steps)")
+    print(f" Steps/epoch: {steps_per_epoch}, "
+          f"max total: {effective_max * steps_per_epoch}")
+    print(f"{'='*60}\n")
+
+    phase_start = time.time()
+
+    for epoch in range(effective_max):
+        epoch_start = time.time()
+        perm = np.random.permutation(len(train_lidar))
+        lidar_shuf = train_lidar[perm]
+        labels_shuf = train_labels[perm]
+
+        epoch_loss = 0.0
+        num_batches = 0
+        show_debug = BN_DEBUG and epoch == 0
+
+        for start in range(0, len(lidar_shuf) - batch_size + 1, batch_size):
+            lidar_batch = lidar_shuf[start:start + batch_size]
+            label_batch = labels_shuf[start:start + batch_size]
+            label_tensor = tf.constant(label_batch, dtype=tf.float32)
+
+            first_batch = show_debug and num_batches == 0
+
+            with tf.GradientTape() as tape:
+                total_loss = 0.0
+                for scale_idx, scale in enumerate(RESOLUTION_SCALES):
+                    set_model_resolution(model, scale_idx)
+                    resized = resize_lidar_1d(lidar_batch, scale)
+                    resized = np.expand_dims(resized, -1).astype(np.float32)
+
+                    if first_batch:
+                        print(f"  Scale {scale}x (bank {scale_idx}), "
+                              f"input shape {resized.shape}:")
+
+                    preds = model(resized, training=True)
+                    total_loss += tf.reduce_mean(loss_fn(label_tensor, preds))
+
+                avg_loss = total_loss / len(RESOLUTION_SCALES)
+
+            grads = tape.gradient(avg_loss, model.trainable_variables)
+            optimizer.apply_gradients(zip(grads, model.trainable_variables))
+
+            if first_batch:
+                BN_DEBUG = False
+
+            epoch_loss += float(avg_loss)
+            num_batches += 1
+
+            if num_batches % 100 == 0 or num_batches == 1 and INCREMENTAL:
+                current_step = (epoch * steps_per_epoch) + num_batches
+                current_lr = float(schedule(current_step))
+                print(
+                    f'    batch {num_batches}/{steps_per_epoch} '
+                    f'loss:{float(avg_loss):.4f} lr:{current_lr:.2e}')
+
+            if TEST_MODE:
+                print(f"  [TEST MODE] Trained 1 batch, stopping epoch.")
+                break
+
+        avg_epoch_loss = epoch_loss / max(num_batches, 1)
+
+        # Per-resolution validation
+        val_losses = {}
+        for scale_idx, scale in enumerate(RESOLUTION_SCALES):
+            set_model_resolution(model, scale_idx)
+            resized_test = resize_lidar_1d(test_lidar, scale)
+            resized_test = np.expand_dims(resized_test, -1).astype(np.float32)
+
+            val_preds = []
+            for vstart in range(0, len(resized_test), batch_size):
+                vbatch = resized_test[vstart:vstart + batch_size]
+                vp = model(vbatch, training=False)
+                val_preds.append(vp.numpy())
+                if TEST_MODE:
+                    break
+            val_preds = np.concatenate(val_preds, axis=0)
+            val_losses[scale] = float(tf.reduce_mean(
+                loss_fn(test_labels[:len(val_preds)], val_preds)))
+
+        avg_val = sum(val_losses.values()) / len(val_losses)
+
+        history_train.append(avg_epoch_loss)
+        history_val.append(avg_val)
+        for s in RESOLUTION_SCALES:
+            history_val_per_res[s].append(val_losses[s])
+
+        current_step = (epoch + 1) * steps_per_epoch
+        current_lr = float(schedule(current_step))
+        epoch_time = int(time.time() - epoch_start)
+
+        # Early stopping check
+        improved = avg_val < (best_val_loss - min_delta)
+        if improved:
+            best_val_loss = avg_val
+            best_weights = [w.numpy() for w in model.trainable_variables]
+            epochs_without_improvement = 0
+            marker = " *"  # mark best epoch
+        else:
+            epochs_without_improvement += 1
+            marker = ""
+
+        scale_str = " | ".join(
+            f"{s:.2f}x:{val_losses[s]:.4f}" for s in RESOLUTION_SCALES)
+        print(
+            f'  [{phase_name}] Epoch {epoch+1}/{effective_max} '
+            f'loss:{avg_epoch_loss:.4f} val:{avg_val:.4f} '
+            f'lr:{current_lr:.2e} ({epoch_time}s) '
+            f'[{scale_str}] '
+            f'patience:{epochs_without_improvement}/{patience}{marker}')
+
+        if epochs_without_improvement >= patience and not TEST_MODE:
+            print(f"\n  Early stopping: no improvement for {patience} epochs.")
+            print(f"  Best val loss: {best_val_loss:.4f}")
+            break
+
+    # Restore best weights
+    if best_weights is not None and not TEST_MODE:
+        for var, w in zip(model.trainable_variables, best_weights):
+            var.assign(w)
+        print(f"  Restored best weights (val loss {best_val_loss:.4f})")
+
+    elapsed = int(time.time() - phase_start)
+    final_epoch = len(history_train)
+    print(f"  [{phase_name}] Completed: {final_epoch} epochs in {elapsed}s\n")
+
+    return history_train, history_val, dict(history_val_per_res)
+
+
+#========================================================
+# Load datasets
+#========================================================
+
+print("\n========== Loading Phase 1 (all .db3 except Phase 2) ==========")
+p1_lidar, p1_servo, p1_speed, p1_max = load_dataset(PHASE1_PATHS, down_sample_param)
+print(f"Phase 1 total: {len(p1_lidar)} samples, max_speed={p1_max:.2f}")
+
+print("\n========== Loading Phase 2 (selected files) ==========")
+p2_lidar, p2_servo, p2_speed, p2_max = load_dataset(PHASE2_PATHS, down_sample_param)
+print(f"Phase 2 total: {len(p2_lidar)} samples, max_speed={p2_max:.2f}")
+
+global_max_speed = max(p1_max, p2_max)
+global_min_speed = 0
+print(f"\nGlobal speed range: [{global_min_speed}, {global_max_speed:.2f}]")
+
+phase1_data = prepare_split(p1_lidar, p1_servo, p1_speed, global_max_speed)
+phase2_data = prepare_split(p2_lidar, p2_servo, p2_speed, global_max_speed)
+
+num_lidar_range_values = phase1_data['train_lidar'].shape[1]
+assert phase2_data['train_lidar'].shape[1] == num_lidar_range_values
+print(f'num_lidar_range_values: {num_lidar_range_values}')
+for s in RESOLUTION_SCALES:
+    print(f'  Scale {s:.2f}x -> {int(round(num_lidar_range_values * s))} input points')
 
 #======================================================
 # Build Model
 #======================================================
 
-num_lidar_range_values = len(lidar[0])
-print(f'num_lidar_range_values: {num_lidar_range_values}')
-print(f'Resolution scales: {RESOLUTION_SCALES}')
-for s in RESOLUTION_SCALES:
-    print(f'  Scale {s:.2f}x -> {int(round(num_lidar_range_values * s))} input points')
-
-# Build with placeholder native_length=1; patched after build
 model = tf.keras.Sequential([
     tf.keras.layers.Conv1D(24, 10, strides=4, activation='relu', input_shape=(None, 1)),
     ResolutionAwareBatchNormalization(RESOLUTION_SCALES, name='rabn_1'),
@@ -429,148 +654,91 @@ model = tf.keras.Sequential([
     tf.keras.layers.Dense(2, activation='tanh'),
 ])
 
-# Build and patch BN expected lengths from actual conv configs
 model(np.zeros((1, num_lidar_range_values, 1), dtype=np.float32))
 bn_native_lengths = patch_bn_native_lengths(model, num_lidar_range_values)
 print("BN layer native lengths:", bn_native_lengths)
 print(model.summary())
 
 #======================================================
-# Training
+# Phase 1: Train on all .db3 EXCEPT Phase 2 files
 #======================================================
 
-optimizer = Adam(lr)
-loss_fn = tf.keras.losses.Huber()
-
-history_train_loss = []
-history_val_loss = []
-history_val_per_res = defaultdict(list)
-
-start_time = time.time()
-
-for epoch in range(num_epochs):
-    perm = np.random.permutation(len(lidar))
-    lidar_shuffled = lidar[perm]
-    train_data_shuffled = train_data[perm]
-
-    epoch_loss = 0.0
-    num_batches = 0
-
-    if epoch == 0 and BN_DEBUG:
-        print("\n[BN DEBUG] First batch trace:")
-
-    for start in range(0, len(lidar_shuffled) - batch_size + 1, batch_size):
-        lidar_batch = lidar_shuffled[start:start + batch_size]
-        label_batch = train_data_shuffled[start:start + batch_size]
-        label_tensor = tf.constant(label_batch, dtype=tf.float32)
-
-        show_debug = BN_DEBUG and epoch == 0 and num_batches == 0
-
-        with tf.GradientTape() as tape:
-            total_loss = 0.0
-            for scale_idx, scale in enumerate(RESOLUTION_SCALES):
-                set_model_resolution(model, scale_idx)
-                resized = resize_lidar_1d(lidar_batch, scale)
-                resized = np.expand_dims(resized, -1).astype(np.float32)
-
-                if show_debug:
-                    print(f"\n  Scale {scale}x (bank {scale_idx}), "
-                          f"input shape {resized.shape}:")
-
-                preds = model(resized, training=True)
-                total_loss += tf.reduce_mean(loss_fn(label_tensor, preds))
-
-            avg_loss = total_loss / len(RESOLUTION_SCALES)
-
-        gradients = tape.gradient(avg_loss, model.trainable_variables)
-        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-
-        if show_debug:
-            BN_DEBUG = False
-
-        epoch_loss += float(avg_loss)
-        num_batches += 1
-
-    avg_epoch_loss = epoch_loss / max(num_batches, 1)
-
-    # Per-resolution validation
-    val_losses = {}
-    for scale_idx, scale in enumerate(RESOLUTION_SCALES):
-        set_model_resolution(model, scale_idx)
-        resized_test = resize_lidar_1d(test_lidar, scale)
-        resized_test = np.expand_dims(resized_test, -1).astype(np.float32)
-
-        val_preds = []
-        for vstart in range(0, len(resized_test), batch_size):
-            vbatch = resized_test[vstart:vstart + batch_size]
-            vp = model(vbatch, training=False)
-            val_preds.append(vp.numpy())
-        val_preds = np.concatenate(val_preds, axis=0)
-        val_losses[scale] = float(tf.reduce_mean(
-            loss_fn(test_data[:len(val_preds)], val_preds)
-        ))
-
-    avg_val_loss = sum(val_losses.values()) / len(val_losses)
-
-    history_train_loss.append(avg_epoch_loss)
-    history_val_loss.append(avg_val_loss)
-    for scale in RESOLUTION_SCALES:
-        history_val_per_res[scale].append(val_losses[scale])
-
-    scale_str = " | ".join(
-        f"{s:.2f}x: {val_losses[s]:.4f}" for s in RESOLUTION_SCALES)
-    print(
-        f'Epoch {epoch+1}/{num_epochs} - loss: {avg_epoch_loss:.4f} '
-        f'- val_loss: {avg_val_loss:.4f} [{scale_str}]'
-    )
-
-print(f'=============>{int(time.time() - start_time)} seconds<=============')
+p1_train, p1_val, p1_val_res = run_training_phase(
+    model, phase1_data, MAX_EPOCHS, lr, batch_size, warmup_epochs,
+    PATIENCE, MIN_DELTA,
+    phase_name="Phase 1 (general)",
+)
 
 #======================================================
-# BN Calibration
+# Phase 2: Train on selected files — fresh schedule,
+# same base LR, full warmup + decay cycle
+#======================================================
+
+p2_train, p2_val, p2_val_res = run_training_phase(
+    model, phase2_data, MAX_EPOCHS, lr, batch_size, warmup_epochs,
+    PATIENCE, MIN_DELTA,
+    phase_name="Phase 2 (selected)",
+)
+
+#======================================================
+# BN Calibration (on Phase 2 data — the fine-tuning set)
 #======================================================
 
 if CALIBRATE_BN:
-    print("Running BN calibration sweep...")
+    print("Running BN calibration sweep on Phase 2 data...")
     calibrate_batch_norm(
-        model, lidar, RESOLUTION_SCALES, batch_size, CALIBRATION_MAX_BATCHES)
+        model, phase2_data['train_lidar'], RESOLUTION_SCALES,
+        batch_size, 1 if TEST_MODE else CALIBRATION_MAX_BATCHES)
 
 #======================================================
 # Loss Plot
 #======================================================
 
-plt.plot(history_train_loss, label='Train')
-plt.plot(history_val_loss, label='Val (avg)', linewidth=2)
-for scale in RESOLUTION_SCALES:
-    plt.plot(
-        history_val_per_res[scale],
-        label=f'Val {scale:.2f}x',
-        linestyle='--',
-    )
-plt.title('Model Loss')
-plt.ylabel('Loss')
-plt.xlabel('Epoch')
-plt.legend()
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+ax1.set_title(f'Phase 1 (general) — {len(p1_train)} epochs')
+ax1.plot(p1_train, label='Train')
+ax1.plot(p1_val, label='Val (avg)', linewidth=2)
+for s in RESOLUTION_SCALES:
+    ax1.plot(p1_val_res[s], label=f'Val {s:.2f}x', linestyle='--')
+ax1.set_xlabel('Epoch')
+ax1.set_ylabel('Loss')
+ax1.legend()
+
+ax2.set_title(f'Phase 2 (selected) — {len(p2_train)} epochs')
+ax2.plot(p2_train, label='Train')
+ax2.plot(p2_val, label='Val (avg)', linewidth=2)
+for s in RESOLUTION_SCALES:
+    ax2.plot(p2_val_res[s], label=f'Val {s:.2f}x', linestyle='--')
+ax2.set_xlabel('Epoch')
+ax2.set_ylabel('Loss')
+ax2.legend()
+
+plt.tight_layout()
 plt.savefig(loss_figure_path)
 plt.close()
+print(f"Loss plot saved to {loss_figure_path}")
 
 #======================================================
-# Model Evaluation
+# Model Evaluation (Phase 2 test set)
 #======================================================
 
+print("\n==========================================")
+print("Model Evaluation (Phase 2 test set)")
 print("==========================================")
-print("Model Evaluation")
-print("==========================================")
+
+test_lidar_final = phase2_data['test_lidar']
+test_labels_final = phase2_data['test_labels']
 
 for scale_idx, scale in enumerate(RESOLUTION_SCALES):
     set_model_resolution(model, scale_idx)
-    resized_test = resize_lidar_1d(test_lidar, scale)
-    resized_test_input = np.expand_dims(resized_test, -1).astype(np.float32)
+    resized_test = resize_lidar_1d(test_lidar_final, scale)
+    resized_input = np.expand_dims(resized_test, -1).astype(np.float32)
 
-    preds = model(resized_test_input, training=False).numpy()
-    hl = huber_loss(test_data, preds)
-    speed_hl = huber_loss(test_data[:, 1], preds[:, 1])
-    servo_hl = huber_loss(test_data[:, 0], preds[:, 0])
+    preds = model(resized_input, training=False).numpy()
+    hl = huber_loss(test_labels_final, preds)
+    speed_hl = huber_loss(test_labels_final[:, 1], preds[:, 1])
+    servo_hl = huber_loss(test_labels_final[:, 0], preds[:, 0])
 
     print(f'\nResolution {scale:.2f}x:')
     print(f'  Overall Huber Loss: {hl:.4f}')
@@ -597,11 +765,12 @@ converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete_func])
 tflite_model = converter.convert()
 tflite_path = ('./Benchmark/f1tenth_benchmarks/zarrar/'
                + model_name + '_noquantized.tflite')
+os.makedirs(os.path.dirname(tflite_path), exist_ok=True)
 with open(tflite_path, 'wb') as f:
     f.write(tflite_model)
 print(f"{model_name}_noquantized.tflite saved.")
 
-rep_32 = lidar[:200].astype(np.float32)
+rep_32 = phase2_data['train_lidar'][:200].astype(np.float32)
 rep_32 = np.expand_dims(rep_32, -1)
 
 def representative_data_gen():
@@ -685,9 +854,9 @@ for m_name in model_files:
     if not os.path.exists(m_name):
         print(f"Skipping {m_name} (not found)")
         continue
-    y_pred, inf_times = evaluate_model(m_name, test_lidar, test_data)
+    y_pred, inf_times = evaluate_model(m_name, test_lidar_final, test_labels_final)
     all_inference_times_micros.append(inf_times)
-    print(f'Huber Loss for {m_name}: {huber_loss(test_data, y_pred)}\n')
+    print(f'Huber Loss for {m_name}: {huber_loss(test_labels_final, y_pred)}\n')
 
 if all_inference_times_micros:
     plt.figure()
