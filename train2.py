@@ -40,7 +40,7 @@ INCREMENTAL = False
 
 TEST_MODE = False  # Flip to True for single-batch pipeline test
 
-SKIP_PHASE1 = True  # If True, skip Phase 1 and run Phase 2 with flat LR
+SKIP_PHASE1 = False  # If True, skip Phase 1 and run Phase 2 with flat LR
 PHASE2_SIMPLE_EPOCHS = 20
 
 # Performance flags
@@ -263,8 +263,6 @@ class ResolutionAwareBatchNormalization(tf.keras.layers.Layer):
 
     def call(self, x, training=False):
         if training:
-            # idx is a Python int, captured at tf.function trace time.
-            # Each unrolled scale iteration traces with its own idx value.
             idx = self._current_scale_index
 
             mean = tf.reduce_mean(x, axis=[0, 1])
@@ -272,11 +270,9 @@ class ResolutionAwareBatchNormalization(tf.keras.layers.Layer):
 
             m = self.momentum
             if m is None:
-                # Cumulative moving average (used during BN calibration)
                 count = self.all_num_batches[idx]
                 m = 1.0 / (tf.cast(count, tf.float32) + 1.0)
 
-            # Pure-TF running stat updates (no .numpy())
             old_mean = self.all_running_means[idx]
             old_var = self.all_running_vars[idx]
             new_mean = old_mean * (1.0 - m) + mean * m
@@ -298,7 +294,6 @@ class ResolutionAwareBatchNormalization(tf.keras.layers.Layer):
                     [[idx]],
                     [self.all_num_batches[idx] + 1.0]))
         else:
-            # Inference: auto-detect scale from spatial dimension
             idx = self._resolve_index_from_shape(x)
             mean = tf.gather(self.all_running_means, idx)
             var = tf.gather(self.all_running_vars, idx)
@@ -326,6 +321,82 @@ def set_model_resolution(model, scale_index):
     for layer in model.layers:
         if isinstance(layer, ResolutionAwareBatchNormalization):
             layer.set_scale_index(scale_index)
+
+
+#========================================================
+# Multi-Resolution Training Wrapper
+#========================================================
+
+class MultiResolutionTrainer(tf.keras.Model):
+    """Thin wrapper that adds multi-resolution train/test steps
+    to any regular Keras model. Architecture stays untouched."""
+
+    def __init__(self, inner_model, resolution_scales,
+                 use_mixed_precision=False, **kwargs):
+        super().__init__(**kwargs)
+        self.inner = inner_model
+        self.resolution_scales = resolution_scales
+        self.num_scales_f = float(len(resolution_scales))
+        self._use_mp = use_mixed_precision
+        self.loss_fn = tf.keras.losses.Huber()
+
+        self.loss_tracker = tf.keras.metrics.Mean(name='loss')
+        self.scale_loss_trackers = [
+            tf.keras.metrics.Mean(name=f'loss_{s:.2f}x')
+            for s in resolution_scales
+        ]
+
+    @property
+    def metrics(self):
+        return [self.loss_tracker] + self.scale_loss_trackers
+
+    def call(self, inputs, training=False):
+        return self.inner(inputs, training=training)
+
+    def train_step(self, data):
+        scale_inputs, labels = data
+
+        with tf.GradientTape() as tape:
+            total_loss = tf.constant(0.0)
+            for scale_idx in range(len(self.resolution_scales)):
+                set_model_resolution(self.inner, scale_idx)
+                preds = self.inner(scale_inputs[scale_idx], training=True)
+                total_loss = total_loss + tf.reduce_mean(
+                    self.loss_fn(labels, preds))
+            avg_loss = total_loss / self.num_scales_f
+
+            if self._use_mp:
+                scaled_loss = self.optimizer.get_scaled_loss(avg_loss)
+
+        if self._use_mp:
+            grads = tape.gradient(scaled_loss, self.inner.trainable_variables)
+            grads = self.optimizer.get_unscaled_gradients(grads)
+        else:
+            grads = tape.gradient(avg_loss, self.inner.trainable_variables)
+
+        self.optimizer.apply_gradients(
+            zip(grads, self.inner.trainable_variables))
+        self.loss_tracker.update_state(avg_loss)
+        return {'loss': self.loss_tracker.result()}
+
+    def test_step(self, data):
+        scale_inputs, labels = data
+
+        total_loss = tf.constant(0.0)
+        for scale_idx in range(len(self.resolution_scales)):
+            set_model_resolution(self.inner, scale_idx)
+            preds = self.inner(scale_inputs[scale_idx], training=False)
+            scale_loss = tf.reduce_mean(self.loss_fn(labels, preds))
+            total_loss = total_loss + scale_loss
+            self.scale_loss_trackers[scale_idx].update_state(scale_loss)
+
+        avg_loss = total_loss / self.num_scales_f
+        self.loss_tracker.update_state(avg_loss)
+
+        results = {'loss': self.loss_tracker.result()}
+        for i, s in enumerate(self.resolution_scales):
+            results[f'loss_{s:.2f}x'] = self.scale_loss_trackers[i].result()
+        return results
 
 
 #========================================================
@@ -445,20 +516,12 @@ def prepare_split(lidar, servo, speed, max_speed, min_speed=0,
 
 
 #========================================================
-# Training Loop (one phase) — tf.data + @tf.function
+# Training Phase (model.fit with callbacks)
 #========================================================
 
 def run_training_phase(model, data, max_epochs, base_lr, batch_size,
                        warmup_epochs, patience, min_delta,
                        phase_name="Phase"):
-    """Multi-resolution training with:
-      - Precomputed per-scale data
-      - tf.data pipelines with shuffle / batch / prefetch
-      - @tf.function-compiled train and val steps
-      - Optional XLA (jit_compile) and mixed precision
-      - Warmup + cosine decay LR schedule
-      - Early stopping with best-weight restore
-    """
 
     train_lidar = data['train_lidar']
     train_labels = data['train_labels']
@@ -468,7 +531,7 @@ def run_training_phase(model, data, max_epochs, base_lr, batch_size,
     effective_max = 1 if TEST_MODE else max_epochs
 
     # ------------------------------------------------------------------
-    # 1) Precompute resized arrays for every scale (done once in NumPy)
+    # 1) Precompute resized arrays for every scale
     # ------------------------------------------------------------------
     print(f"  Precomputing resized data for {len(RESOLUTION_SCALES)} scales...")
     train_per_scale = []
@@ -483,23 +546,18 @@ def run_training_phase(model, data, max_epochs, base_lr, batch_size,
     test_labels_f32 = test_labels.astype(np.float32)
 
     # ------------------------------------------------------------------
-    # 2) Build tf.data pipelines
+    # 2) tf.data: x = tuple of per-scale arrays, y = labels
     # ------------------------------------------------------------------
-    # Training: yields (scale0_batch, scale1_batch, ..., labels)
     train_ds = tf.data.Dataset.from_tensor_slices(
-        tuple(train_per_scale) + (train_labels_f32,))
+        (tuple(train_per_scale), train_labels_f32))
     train_ds = (train_ds
                 .shuffle(min(len(train_lidar), SHUFFLE_BUFFER))
                 .batch(batch_size, drop_remainder=True)
                 .prefetch(tf.data.AUTOTUNE))
 
-    # Validation: one dataset per scale → (x_batch, y_batch)
-    val_datasets = []
-    for i in range(len(RESOLUTION_SCALES)):
-        vds = tf.data.Dataset.from_tensor_slices(
-            (test_per_scale[i], test_labels_f32))
-        vds = vds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-        val_datasets.append(vds)
+    val_ds = tf.data.Dataset.from_tensor_slices(
+        (tuple(test_per_scale), test_labels_f32))
+    val_ds = val_ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
     # ------------------------------------------------------------------
     # 3) Optimizer + schedule
@@ -508,157 +566,63 @@ def run_training_phase(model, data, max_epochs, base_lr, batch_size,
     schedule = build_lr_schedule(
         base_lr, effective_max, steps_per_epoch, warmup_epochs)
     optimizer = Adam(learning_rate=schedule)
-
     if USE_MIXED_PRECISION:
         optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
 
-    loss_fn = tf.keras.losses.Huber()
-    num_scales_f = float(len(RESOLUTION_SCALES))
+    # ------------------------------------------------------------------
+    # 4) Wrap the plain model for multi-res training
+    # ------------------------------------------------------------------
+    trainer = MultiResolutionTrainer(
+        model, RESOLUTION_SCALES, USE_MIXED_PRECISION)
+    trainer.compile(optimizer=optimizer, jit_compile=USE_XLA)
+
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=patience,
+            min_delta=min_delta,
+            restore_best_weights=True,
+            verbose=1,
+        ),
+    ]
 
     # ------------------------------------------------------------------
-    # 4) Compiled train step
-    #    The Python for-loop over scales is UNROLLED at trace time,
-    #    so each scale gets its own subgraph with the correct BN index.
+    # 5) Fit
     # ------------------------------------------------------------------
-    @tf.function(jit_compile=USE_XLA)
-    def train_step(*args):
-        labels = args[-1]
-        scale_batches = args[:-1]
-
-        with tf.GradientTape() as tape:
-            total_loss = tf.constant(0.0)
-            for scale_idx, s_batch in enumerate(scale_batches):
-                set_model_resolution(model, scale_idx)
-                preds = model(s_batch, training=True)
-                total_loss = total_loss + tf.reduce_mean(
-                    loss_fn(labels, preds))
-            avg_loss = total_loss / num_scales_f
-
-            if USE_MIXED_PRECISION:
-                scaled_loss = optimizer.get_scaled_loss(avg_loss)
-
-        if USE_MIXED_PRECISION:
-            grads = tape.gradient(scaled_loss, model.trainable_variables)
-            grads = optimizer.get_unscaled_gradients(grads)
-        else:
-            grads = tape.gradient(avg_loss, model.trainable_variables)
-
-        optimizer.apply_gradients(zip(grads, model.trainable_variables))
-        return avg_loss
-
-    # ------------------------------------------------------------------
-    # 5) Compiled val step
-    #    Different input shapes (per scale) cause separate traces,
-    #    each capturing the correct BN index via _resolve_index_from_shape.
-    # ------------------------------------------------------------------
-    @tf.function
-    def val_step(x_batch, y_batch):
-        preds = model(x_batch, training=False)
-        return tf.reduce_mean(loss_fn(y_batch, preds))
-
-    # ------------------------------------------------------------------
-    # 6) Training loop
-    # ------------------------------------------------------------------
-    history_train = []
-    history_val = []
-    history_val_per_res = defaultdict(list)
-
-    best_val_loss = float('inf')
-    best_weights = None
-    epochs_without_improvement = 0
-
     print(f"\n{'='*60}")
     print(f" {phase_name}: up to {effective_max} epochs, base_lr={base_lr:.2e}")
     print(f" Early stopping: patience={patience}, min_delta={min_delta:.1e}")
     if TEST_MODE:
-        print(f" *** TEST MODE: 1 epoch, 1 batch only ***")
+        print(f" *** TEST MODE: 1 epoch only ***")
     print(f" {len(train_lidar)} train / {len(test_lidar)} test samples")
     print(f" Warmup: {warmup_epochs} epochs "
           f"({warmup_epochs * steps_per_epoch} steps)")
-    print(f" Steps/epoch: {steps_per_epoch}, "
-          f"max total: {effective_max * steps_per_epoch}")
-    print(f" tf.data + @tf.function enabled | "
-          f"XLA={USE_XLA} | mixed_prec={USE_MIXED_PRECISION}")
+    print(f" Steps/epoch: {steps_per_epoch}")
+    print(f" XLA={USE_XLA} | mixed_prec={USE_MIXED_PRECISION}")
     print(f"{'='*60}\n")
 
-    phase_start = time.time()
+    history = trainer.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=effective_max,
+        callbacks=callbacks,
+        verbose=1,
+    )
 
-    for epoch in range(effective_max):
-        epoch_start = time.time()
+    # ------------------------------------------------------------------
+    # 6) Extract history in the original return format
+    # ------------------------------------------------------------------
+    h = history.history
+    train_losses = h.get('loss', [])
+    val_losses = h.get('val_loss', [])
+    val_per_res = {}
+    for s in RESOLUTION_SCALES:
+        val_per_res[s] = h.get(f'val_loss_{s:.2f}x', [])
 
-        epoch_loss = 0.0
-        num_batches = 0
+    final_epoch = len(train_losses)
+    print(f"  [{phase_name}] Completed: {final_epoch} epochs\n")
 
-        for batch_data in train_ds:
-            loss = train_step(*batch_data)
-            epoch_loss += float(loss)
-            num_batches += 1
-
-            if TEST_MODE:
-                print(f"  [TEST MODE] Trained 1 batch, stopping epoch.")
-                break
-
-        avg_epoch_loss = epoch_loss / max(num_batches, 1)
-
-        # Per-resolution validation
-        val_losses = {}
-        for scale_idx, scale in enumerate(RESOLUTION_SCALES):
-            total_val = 0.0
-            n_val = 0
-            for x_batch, y_batch in val_datasets[scale_idx]:
-                total_val += float(val_step(x_batch, y_batch))
-                n_val += 1
-                if TEST_MODE:
-                    break
-            val_losses[scale] = total_val / max(n_val, 1)
-
-        avg_val = sum(val_losses.values()) / len(val_losses)
-
-        history_train.append(avg_epoch_loss)
-        history_val.append(avg_val)
-        for s in RESOLUTION_SCALES:
-            history_val_per_res[s].append(val_losses[s])
-
-        current_step = (epoch + 1) * steps_per_epoch
-        current_lr = float(schedule(current_step))
-        epoch_time = int(time.time() - epoch_start)
-
-        # Early stopping check
-        improved = avg_val < (best_val_loss - min_delta)
-        if improved:
-            best_val_loss = avg_val
-            best_weights = [w.numpy() for w in model.trainable_variables]
-            epochs_without_improvement = 0
-            marker = " *"
-        else:
-            epochs_without_improvement += 1
-            marker = ""
-
-        scale_str = " | ".join(
-            f"{s:.2f}x:{val_losses[s]:.4f}" for s in RESOLUTION_SCALES)
-        print(
-            f'  [{phase_name}] Epoch {epoch+1}/{effective_max} '
-            f'loss:{avg_epoch_loss:.4f} val:{avg_val:.4f} '
-            f'lr:{current_lr:.2e} ({epoch_time}s) '
-            f'[{scale_str}] '
-            f'patience:{epochs_without_improvement}/{patience}{marker}')
-
-        if epochs_without_improvement >= patience and not TEST_MODE:
-            print(f"\n  Early stopping: no improvement for {patience} epochs.")
-            print(f"  Best val loss: {best_val_loss:.4f}")
-            break
-
-    # Restore best weights
-    if best_weights is not None and not TEST_MODE:
-        for var, w in zip(model.trainable_variables, best_weights):
-            var.assign(w)
-        print(f"  Restored best weights (val loss {best_val_loss:.4f})")
-
-    elapsed = int(time.time() - phase_start)
-    final_epoch = len(history_train)
-    print(f"  [{phase_name}] Completed: {final_epoch} epochs in {elapsed}s\n")
-
-    return history_train, history_val, dict(history_val_per_res)
+    return train_losses, val_losses, val_per_res
 
 
 #========================================================
@@ -707,17 +671,16 @@ for s in RESOLUTION_SCALES:
 output_dtype = 'float32' if USE_MIXED_PRECISION else None
 
 model = tf.keras.Sequential([
-    tf.keras.layers.Conv1D(
-        24, 10, strides=4, activation='relu', input_shape=(None, 1)),
+    tf.keras.layers.Conv1D(32, 10, strides=4, activation='relu', input_shape=(None, 1)),
     ResolutionAwareBatchNormalization(RESOLUTION_SCALES, name='rabn_1'),
 
-    tf.keras.layers.Conv1D(36, 8, strides=4, activation='relu'),
+    tf.keras.layers.Conv1D(48, 8, strides=4, activation='relu'),
     ResolutionAwareBatchNormalization(RESOLUTION_SCALES, name='rabn_2'),
 
-    tf.keras.layers.Conv1D(48, 4, strides=2, activation='relu'),
+    tf.keras.layers.Conv1D(48, 4, strides=4, activation='relu'),
     ResolutionAwareBatchNormalization(RESOLUTION_SCALES, name='rabn_3'),
 
-    tf.keras.layers.Conv1D(64, 3, activation='relu'),
+    tf.keras.layers.Conv1D(64, 3, strides=2, activation='relu'),
     ResolutionAwareBatchNormalization(RESOLUTION_SCALES, name='rabn_4'),
 
     tf.keras.layers.Conv1D(64, 3, activation='relu'),

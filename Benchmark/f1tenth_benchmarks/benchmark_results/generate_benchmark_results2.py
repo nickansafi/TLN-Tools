@@ -184,7 +184,7 @@ def tinylidar_il_dropout():
     plot_trajectory_analysis(planner.name, test_id)
 
 def tinylidar_il_a(scale):
-    test_id = "benchmark_tiny_il_l"
+    test_id = "benchmark_tiny_il_l" + str(scale)
     print(test_id)
     planner = TinyLidarNet(test_id,1, 0,os.path.abspath(__file__).rpartition("/Benchmark")[0]+'/Benchmark/f1tenth_benchmarks/zarrar/TLN_noquantized.tflite',scale)
     # planner = TinyLidarNet(test_id,1, 0,'/home/m810z573/Downloads/f1tenth_benchmarks/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_TLN_L_Dropout_noquantized.tflite')
