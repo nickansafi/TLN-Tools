@@ -38,6 +38,11 @@ BN_DEBUG = True
 MATCH = False
 INCREMENTAL = False
 
+# Per-resolution affine (gamma/beta) as in the paper.
+# False = each BN bank owns its own gamma & beta (paper-faithful).
+# True  = single gamma & beta shared across all scales (original code).
+SHARED_AFFINE = False
+
 TEST_MODE = False  # Flip to True for single-batch pipeline test
 
 SKIP_PHASE1 = False  # If True, skip Phase 1 and run Phase 2 with flat LR
@@ -224,13 +229,14 @@ def build_lr_schedule(base_lr, num_epochs, steps_per_epoch, warmup_epochs=2):
 class ResolutionAwareBatchNormalization(tf.keras.layers.Layer):
 
     def __init__(self, resolution_scales, native_length=1,
-                 momentum=0.1, epsilon=1e-5, **kwargs):
+                 momentum=0.1, epsilon=1e-5, shared_affine=True, **kwargs):
         super().__init__(**kwargs)
         self.resolution_scales = [float(s) for s in resolution_scales]
         self.num_scales = len(self.resolution_scales)
         self.native_length = native_length
         self.momentum = momentum
         self.epsilon = epsilon
+        self.shared_affine = shared_affine
         self._current_scale_index = 0
         self.expected_lengths = [
             int(round(native_length * s)) for s in self.resolution_scales
@@ -238,10 +244,23 @@ class ResolutionAwareBatchNormalization(tf.keras.layers.Layer):
 
     def build(self, input_shape):
         nf = input_shape[-1]
-        self.gamma = self.add_weight(
-            name='gamma', shape=(nf,), initializer='ones', trainable=True)
-        self.beta = self.add_weight(
-            name='beta', shape=(nf,), initializer='zeros', trainable=True)
+
+        if self.shared_affine:
+            # Single gamma/beta shared across all resolutions (original behavior)
+            self.gamma = self.add_weight(
+                name='gamma', shape=(nf,), initializer='ones', trainable=True)
+            self.beta = self.add_weight(
+                name='beta', shape=(nf,), initializer='zeros', trainable=True)
+        else:
+            # Per-resolution gamma/beta as described in the paper:
+            # each BN bank gets its own affine parameters
+            self.all_gammas = self.add_weight(
+                name='all_gammas', shape=(self.num_scales, nf),
+                initializer='ones', trainable=True)
+            self.all_betas = self.add_weight(
+                name='all_betas', shape=(self.num_scales, nf),
+                initializer='zeros', trainable=True)
+
         self.all_running_means = self.add_weight(
             name='all_running_means', shape=(self.num_scales, nf),
             initializer='zeros', trainable=False)
@@ -261,8 +280,22 @@ class ResolutionAwareBatchNormalization(tf.keras.layers.Layer):
         expected = tf.constant(self.expected_lengths, dtype=tf.float32)
         return tf.argmin(tf.abs(expected - actual_len), output_type=tf.int32)
 
+    def _get_affine(self, idx):
+        """Return (gamma, beta) for the given scale index."""
+        if self.shared_affine:
+            return self.gamma, self.beta
+        else:
+            # idx is a Python int during training (traced per scale) or
+            # a tf.Tensor during inference (from _resolve_index_from_shape)
+            if isinstance(idx, int):
+                return self.all_gammas[idx], self.all_betas[idx]
+            else:
+                return tf.gather(self.all_gammas, idx), tf.gather(self.all_betas, idx)
+
     def call(self, x, training=False):
         if training:
+            # idx is a Python int, captured at tf.function trace time.
+            # Each unrolled scale iteration traces with its own idx value.
             idx = self._current_scale_index
 
             mean = tf.reduce_mean(x, axis=[0, 1])
@@ -270,9 +303,11 @@ class ResolutionAwareBatchNormalization(tf.keras.layers.Layer):
 
             m = self.momentum
             if m is None:
+                # Cumulative moving average (used during BN calibration)
                 count = self.all_num_batches[idx]
                 m = 1.0 / (tf.cast(count, tf.float32) + 1.0)
 
+            # Pure-TF running stat updates (no .numpy())
             old_mean = self.all_running_means[idx]
             old_var = self.all_running_vars[idx]
             new_mean = old_mean * (1.0 - m) + mean * m
@@ -294,12 +329,14 @@ class ResolutionAwareBatchNormalization(tf.keras.layers.Layer):
                     [[idx]],
                     [self.all_num_batches[idx] + 1.0]))
         else:
+            # Inference: auto-detect scale from spatial dimension
             idx = self._resolve_index_from_shape(x)
             mean = tf.gather(self.all_running_means, idx)
             var = tf.gather(self.all_running_vars, idx)
 
+        gamma, beta = self._get_affine(idx)
         x_norm = (x - mean) / tf.sqrt(var + self.epsilon)
-        return self.gamma * x_norm + self.beta
+        return gamma * x_norm + beta
 
     def reset_running_stats(self):
         self.all_running_means.assign(tf.zeros_like(self.all_running_means))
@@ -313,6 +350,7 @@ class ResolutionAwareBatchNormalization(tf.keras.layers.Layer):
             'native_length': self.native_length,
             'momentum': self.momentum,
             'epsilon': self.epsilon,
+            'shared_affine': self.shared_affine,
         })
         return config
 
@@ -599,6 +637,7 @@ def run_training_phase(model, data, max_epochs, base_lr, batch_size,
           f"({warmup_epochs * steps_per_epoch} steps)")
     print(f" Steps/epoch: {steps_per_epoch}")
     print(f" XLA={USE_XLA} | mixed_prec={USE_MIXED_PRECISION}")
+    print(f" shared_affine={SHARED_AFFINE}")
     print(f"{'='*60}\n")
 
     history = trainer.fit(
@@ -671,20 +710,20 @@ for s in RESOLUTION_SCALES:
 output_dtype = 'float32' if USE_MIXED_PRECISION else None
 
 model = tf.keras.Sequential([
-    tf.keras.layers.Conv1D(32, 10, strides=4, activation='relu', input_shape=(None, 1)),
-    ResolutionAwareBatchNormalization(RESOLUTION_SCALES, name='rabn_1'),
+    tf.keras.layers.Conv1D(32, 40, strides=4, activation='relu', input_shape=(None, 1)),
+    ResolutionAwareBatchNormalization(RESOLUTION_SCALES, shared_affine=SHARED_AFFINE, name='rabn_1'),
+
+    tf.keras.layers.Conv1D(48, 16, strides=4, activation='relu'),
+    ResolutionAwareBatchNormalization(RESOLUTION_SCALES, shared_affine=SHARED_AFFINE, name='rabn_2'),
 
     tf.keras.layers.Conv1D(48, 8, strides=4, activation='relu'),
-    ResolutionAwareBatchNormalization(RESOLUTION_SCALES, name='rabn_2'),
-
-    tf.keras.layers.Conv1D(48, 4, strides=4, activation='relu'),
-    ResolutionAwareBatchNormalization(RESOLUTION_SCALES, name='rabn_3'),
+    ResolutionAwareBatchNormalization(RESOLUTION_SCALES, shared_affine=SHARED_AFFINE, name='rabn_3'),
 
     tf.keras.layers.Conv1D(64, 3, strides=2, activation='relu'),
-    ResolutionAwareBatchNormalization(RESOLUTION_SCALES, name='rabn_4'),
+    ResolutionAwareBatchNormalization(RESOLUTION_SCALES, shared_affine=SHARED_AFFINE, name='rabn_4'),
 
-    tf.keras.layers.Conv1D(64, 3, activation='relu'),
-    ResolutionAwareBatchNormalization(RESOLUTION_SCALES, name='rabn_5'),
+    tf.keras.layers.Conv1D(64, 2, activation='relu'),
+    ResolutionAwareBatchNormalization(RESOLUTION_SCALES, shared_affine=SHARED_AFFINE, name='rabn_5'),
 
     tf.keras.layers.GlobalAveragePooling1D(),
 
