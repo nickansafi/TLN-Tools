@@ -246,14 +246,11 @@ class ResolutionAwareBatchNormalization(tf.keras.layers.Layer):
         nf = input_shape[-1]
 
         if self.shared_affine:
-            # Single gamma/beta shared across all resolutions (original behavior)
             self.gamma = self.add_weight(
                 name='gamma', shape=(nf,), initializer='ones', trainable=True)
             self.beta = self.add_weight(
                 name='beta', shape=(nf,), initializer='zeros', trainable=True)
         else:
-            # Per-resolution gamma/beta as described in the paper:
-            # each BN bank gets its own affine parameters
             self.all_gammas = self.add_weight(
                 name='all_gammas', shape=(self.num_scales, nf),
                 initializer='ones', trainable=True)
@@ -285,8 +282,6 @@ class ResolutionAwareBatchNormalization(tf.keras.layers.Layer):
         if self.shared_affine:
             return self.gamma, self.beta
         else:
-            # idx is a Python int during training (traced per scale) or
-            # a tf.Tensor during inference (from _resolve_index_from_shape)
             if isinstance(idx, int):
                 return self.all_gammas[idx], self.all_betas[idx]
             else:
@@ -294,20 +289,27 @@ class ResolutionAwareBatchNormalization(tf.keras.layers.Layer):
 
     def call(self, x, training=False):
         if training:
-            # idx is a Python int, captured at tf.function trace time.
-            # Each unrolled scale iteration traces with its own idx value.
             idx = self._current_scale_index
+
+            if BN_DEBUG:
+                spatial_dim = x.shape[1] if x.shape[1] is not None else '?'
+                scale = self.resolution_scales[idx]
+                affine_tag = "shared" if self.shared_affine else f"bank[{idx}]"
+                print(
+                    f"  [BN] {self.name} | train | bank={idx} "
+                    f"(scale={scale}) | spatial={spatial_dim} | "
+                    f"expected={self.expected_lengths} | "
+                    f"affine={affine_tag}"
+                )
 
             mean = tf.reduce_mean(x, axis=[0, 1])
             var = tf.math.reduce_variance(x, axis=[0, 1])
 
             m = self.momentum
             if m is None:
-                # Cumulative moving average (used during BN calibration)
                 count = self.all_num_batches[idx]
                 m = 1.0 / (tf.cast(count, tf.float32) + 1.0)
 
-            # Pure-TF running stat updates (no .numpy())
             old_mean = self.all_running_means[idx]
             old_var = self.all_running_vars[idx]
             new_mean = old_mean * (1.0 - m) + mean * m
@@ -329,8 +331,20 @@ class ResolutionAwareBatchNormalization(tf.keras.layers.Layer):
                     [[idx]],
                     [self.all_num_batches[idx] + 1.0]))
         else:
-            # Inference: auto-detect scale from spatial dimension
             idx = self._resolve_index_from_shape(x)
+
+            if BN_DEBUG and tf.executing_eagerly():
+                spatial_dim = x.shape[1] if x.shape[1] is not None else '?'
+                idx_val = int(idx.numpy())
+                scale = self.resolution_scales[idx_val]
+                affine_tag = "shared" if self.shared_affine else f"bank[{idx_val}]"
+                print(
+                    f"  [BN] {self.name} | infer | bank={idx_val} "
+                    f"(scale={scale}) | spatial={spatial_dim} | "
+                    f"expected={self.expected_lengths} | "
+                    f"affine={affine_tag}"
+                )
+
             mean = tf.gather(self.all_running_means, idx)
             var = tf.gather(self.all_running_vars, idx)
 
