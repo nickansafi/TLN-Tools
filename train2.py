@@ -41,7 +41,7 @@ INCREMENTAL = False
 # Per-resolution affine (gamma/beta) as in the paper.
 # False = each BN bank owns its own gamma & beta (paper-faithful).
 # True  = single gamma & beta shared across all scales (original code).
-SHARED_AFFINE = False
+SHARED_AFFINE = True
 
 TEST_MODE = False  # Flip to True for single-batch pipeline test
 
@@ -222,6 +222,30 @@ def build_lr_schedule(base_lr, num_epochs, steps_per_epoch, warmup_epochs=2):
 
 
 #========================================================
+# BN Trace: fire-once debug printing
+#
+# _bn_trace_pending: heading printed, layer lines will print on next forward pass
+# _bn_trace_done:    fully traced, all future prints silenced
+#
+# Flow per scale_index:
+#   1st set_model_resolution(idx) → print heading, add to pending
+#   forward pass                  → BN layers print (idx in pending)
+#   2nd set_model_resolution(idx) → move from pending to done → silence
+#
+# Call reset_bn_trace() to allow a fresh trace (e.g. before evaluation).
+#========================================================
+
+_bn_trace_pending = set()
+_bn_trace_done = set()
+
+
+def reset_bn_trace():
+    """Allow BN trace to fire again (call before a new phase you want traced)."""
+    _bn_trace_pending.clear()
+    _bn_trace_done.clear()
+
+
+#========================================================
 # Resolution-Aware Batch Normalization
 # (pure TF ops — compatible with @tf.function and XLA)
 #========================================================
@@ -291,14 +315,14 @@ class ResolutionAwareBatchNormalization(tf.keras.layers.Layer):
         if training:
             idx = self._current_scale_index
 
-            if BN_DEBUG:
+            if BN_DEBUG and idx in _bn_trace_pending:
                 spatial_dim = x.shape[1] if x.shape[1] is not None else '?'
                 scale = self.resolution_scales[idx]
                 affine_tag = "shared" if self.shared_affine else f"bank[{idx}]"
                 print(
-                    f"  [BN] {self.name} | train | bank={idx} "
-                    f"(scale={scale}) | spatial={spatial_dim} | "
-                    f"expected={self.expected_lengths} | "
+                    f"  {self.name}: spatial={spatial_dim} | "
+                    f"expected={list(self.expected_lengths)} | "
+                    f"bank={idx} (scale={scale}) | "
                     f"affine={affine_tag}"
                 )
 
@@ -334,16 +358,17 @@ class ResolutionAwareBatchNormalization(tf.keras.layers.Layer):
             idx = self._resolve_index_from_shape(x)
 
             if BN_DEBUG and tf.executing_eagerly():
-                spatial_dim = x.shape[1] if x.shape[1] is not None else '?'
                 idx_val = int(idx.numpy())
-                scale = self.resolution_scales[idx_val]
-                affine_tag = "shared" if self.shared_affine else f"bank[{idx_val}]"
-                print(
-                    f"  [BN] {self.name} | infer | bank={idx_val} "
-                    f"(scale={scale}) | spatial={spatial_dim} | "
-                    f"expected={self.expected_lengths} | "
-                    f"affine={affine_tag}"
-                )
+                if idx_val in _bn_trace_pending:
+                    spatial_dim = x.shape[1] if x.shape[1] is not None else '?'
+                    scale = self.resolution_scales[idx_val]
+                    affine_tag = "shared" if self.shared_affine else f"bank[{idx_val}]"
+                    print(
+                        f"  {self.name}: spatial={spatial_dim} | "
+                        f"expected={list(self.expected_lengths)} | "
+                        f"bank={idx_val} (scale={scale}) | "
+                        f"affine={affine_tag}"
+                    )
 
             mean = tf.gather(self.all_running_means, idx)
             var = tf.gather(self.all_running_vars, idx)
@@ -373,6 +398,18 @@ def set_model_resolution(model, scale_index):
     for layer in model.layers:
         if isinstance(layer, ResolutionAwareBatchNormalization):
             layer.set_scale_index(scale_index)
+
+    if BN_DEBUG and scale_index not in _bn_trace_done:
+        if scale_index in _bn_trace_pending:
+            # Second call for this scale: forward pass already printed lines.
+            # Move to done — all future calls are silent.
+            _bn_trace_done.add(scale_index)
+            _bn_trace_pending.discard(scale_index)
+        else:
+            # First call: print heading, mark pending so BN layers print lines.
+            scale = RESOLUTION_SCALES[scale_index] if scale_index < len(RESOLUTION_SCALES) else '?'
+            print(f"\n[BN TRACE] scale={scale}")
+            _bn_trace_pending.add(scale_index)
 
 
 #========================================================
@@ -624,6 +661,9 @@ def run_training_phase(model, data, max_epochs, base_lr, batch_size,
     # ------------------------------------------------------------------
     # 4) Wrap the plain model for multi-res training
     # ------------------------------------------------------------------
+    # Allow a fresh trace for this training phase
+    reset_bn_trace()
+
     trainer = MultiResolutionTrainer(
         model, RESOLUTION_SCALES, USE_MIXED_PRECISION)
     trainer.compile(optimizer=optimizer, jit_compile=USE_XLA)
@@ -724,16 +764,16 @@ for s in RESOLUTION_SCALES:
 output_dtype = 'float32' if USE_MIXED_PRECISION else None
 
 model = tf.keras.Sequential([
-    tf.keras.layers.Conv1D(32, 40, strides=4, activation='relu', input_shape=(None, 1)),
+    tf.keras.layers.Conv1D(24, 40, strides=4, activation='relu', input_shape=(None, 1)),
     ResolutionAwareBatchNormalization(RESOLUTION_SCALES, shared_affine=SHARED_AFFINE, name='rabn_1'),
 
-    tf.keras.layers.Conv1D(48, 16, strides=4, activation='relu'),
+    tf.keras.layers.Conv1D(36, 16, strides=4, activation='relu'),
     ResolutionAwareBatchNormalization(RESOLUTION_SCALES, shared_affine=SHARED_AFFINE, name='rabn_2'),
 
-    tf.keras.layers.Conv1D(48, 8, strides=4, activation='relu'),
+    tf.keras.layers.Conv1D(48, 8, strides=2, activation='relu'),
     ResolutionAwareBatchNormalization(RESOLUTION_SCALES, shared_affine=SHARED_AFFINE, name='rabn_3'),
 
-    tf.keras.layers.Conv1D(64, 3, strides=2, activation='relu'),
+    tf.keras.layers.Conv1D(64, 3, activation='relu'),
     ResolutionAwareBatchNormalization(RESOLUTION_SCALES, shared_affine=SHARED_AFFINE, name='rabn_4'),
 
     tf.keras.layers.Conv1D(64, 2, activation='relu'),
@@ -789,6 +829,7 @@ else:
 
 if CALIBRATE_BN:
     print("Running BN calibration sweep on Phase 2 data...")
+    reset_bn_trace()  # fresh trace for calibration
     calibrate_batch_norm(
         model, phase2_data['train_lidar'], RESOLUTION_SCALES,
         batch_size, 1 if TEST_MODE else CALIBRATION_MAX_BATCHES)
@@ -834,6 +875,8 @@ print(f"Loss plot saved to {loss_figure_path}")
 print("\n==========================================")
 print("Model Evaluation (Phase 2 test set)")
 print("==========================================")
+
+reset_bn_trace()  # fresh trace for evaluation
 
 test_lidar_final = phase2_data['test_lidar']
 test_labels_final = phase2_data['test_labels']

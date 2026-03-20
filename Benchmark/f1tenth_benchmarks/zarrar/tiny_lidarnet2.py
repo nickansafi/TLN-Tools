@@ -6,16 +6,88 @@ import tensorflow as tf
 BN_DEBUG = True
 
 
+def _detect_shared_affine(interpreter, bn_channels, num_scales):
+    """Auto-detect shared vs per-bank affine from TFLite weight shapes."""
+    if not bn_channels:
+        return None
+
+    bn_nf_set = set(bn_channels)
+    num_bn_layers = len(bn_channels)
+
+    details = interpreter.get_tensor_details()
+    bank_shaped = 0
+    for d in details:
+        shape = tuple(d.get('shape', ()))
+        if len(shape) == 2 and shape[0] == num_scales and shape[1] in bn_nf_set:
+            bank_shaped += 1
+
+    if bank_shaped == num_bn_layers * 2:
+        return True
+    if bank_shaped == num_bn_layers * 4:
+        return False
+    return None
+
+
+def _read_expected_lengths(interpreter, num_bn_layers, num_scales, bn_spatials_values):
+    """Read the expected_lengths constant tensors baked into the model."""
+    details = interpreter.get_tensor_details()
+    candidates = []
+    for d in details:
+        shape = tuple(d.get('shape', ()))
+        if shape != (num_scales,):
+            continue
+        dtype = d.get('dtype', None)
+        if dtype not in (np.float32, np.float64):
+            continue
+        try:
+            vals = interpreter.get_tensor(d['index']).flatten().tolist()
+        except ValueError:
+            continue
+        if all(v > 0 and abs(v - round(v)) < 0.01 for v in vals):
+            as_ints = [int(round(v)) for v in vals]
+            if as_ints not in candidates:
+                candidates.append(as_ints)
+
+    if len(candidates) != num_bn_layers:
+        return None
+
+    matched = [None] * num_bn_layers
+    used = [False] * len(candidates)
+    for i, spatial in enumerate(bn_spatials_values):
+        best_j = None
+        best_dist = float('inf')
+        for j, expected in enumerate(candidates):
+            if used[j]:
+                continue
+            dist = min(abs(e - spatial) for e in expected)
+            if dist < best_dist:
+                best_dist = dist
+                best_j = j
+        if best_j is None:
+            return None
+        matched[i] = candidates[best_j]
+        used[best_j] = True
+
+    return matched
+
+
+def _resolve_index(expected, spatial):
+    """Replicate the model's own argmin(|expected - spatial|)."""
+    diffs = [abs(e - spatial) for e in expected]
+    return diffs.index(min(diffs))
+
+
 def bn_trace_from_interpreter(interpreter, scale, resolution_scales=None):
-    """Print conv/BN spatial dims and which bank was selected."""
+    """Print conv/BN spatial dims and which bank was actually selected."""
     if resolution_scales is None:
         resolution_scales = [1.0, 0.75]
+    num_scales = len(resolution_scales)
 
     details = interpreter.get_tensor_details()
     print(f"\n[BN TRACE] scale={scale}")
 
-    # Collect BN output spatial dims
     bn_spatials = {}
+    bn_channels = []
     for d in details:
         try:
             tensor = interpreter.get_tensor(d['index'])
@@ -27,19 +99,51 @@ def bn_trace_from_interpreter(interpreter, scale, resolution_scales=None):
         if '/add_1' in name:
             layer = name.split('/')[1] if '/' in name else name
             bn_spatials[layer] = tensor.shape[1]
+            bn_channels.append(tensor.shape[2])
 
-    # Read expected_lengths from the GatherV2 constant tensors
-    # or derive from the ratio of spatial dims across scales.
-    # Simplest: compute expected from native = spatial / scale
-    for layer, spatial in bn_spatials.items():
-        native = int(round(spatial / scale))
-        expected = [int(round(native * s)) for s in resolution_scales]
-        diffs = [abs(e - spatial) for e in expected]
-        selected = diffs.index(min(diffs))
+    if not bn_spatials:
+        print("  [BN TRACE FAILED] no BN output tensors found")
+        return
+
+    num_bn_layers = len(bn_spatials)
+    spatial_values = list(bn_spatials.values())
+
+    shared_affine = _detect_shared_affine(interpreter, bn_channels, num_scales)
+    expected_per_layer = _read_expected_lengths(
+        interpreter, num_bn_layers, num_scales, spatial_values)
+
+    if expected_per_layer is None:
+        print(f"  [BN TRACE FAILED] could not read expected_lengths constants "
+              f"(expected {num_bn_layers} float tensors of shape ({num_scales},))")
+    if shared_affine is None:
+        print(f"  [BN TRACE FAILED] could not determine affine mode "
+              f"(expected {num_bn_layers * 2} or {num_bn_layers * 4} "
+              f"tensors of shape ({num_scales}, nf))")
+
+    for i, (layer, spatial) in enumerate(bn_spatials.items()):
+        if expected_per_layer is not None:
+            expected = expected_per_layer[i]
+            selected = _resolve_index(expected, spatial)
+            scale_tag = f"scale={resolution_scales[selected]}"
+            bank_tag = str(selected)
+        else:
+            expected = '?'
+            selected = None
+            scale_tag = "scale=?"
+            bank_tag = "?"
+
+        if shared_affine is True:
+            affine_tag = "shared"
+        elif shared_affine is False and selected is not None:
+            affine_tag = f"bank[{selected}]"
+        else:
+            affine_tag = "?"
+
         print(
             f"  {layer}: spatial={spatial} | "
             f"expected={expected} | "
-            f"bank={selected} (scale={resolution_scales[selected]})"
+            f"bank={bank_tag} ({scale_tag}) | "
+            f"affine={affine_tag}"
         )
 
 

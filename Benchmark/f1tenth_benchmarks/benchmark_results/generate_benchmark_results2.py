@@ -13,6 +13,7 @@ import os
 
 NUMBER_OF_LAPS = 10
 
+PLOT = False
 
 def generate_racelines():
     map_list = ['example', 'MoscowRaceway']
@@ -191,7 +192,8 @@ def tinylidar_il_a(scale):
     # planner = TinyLidarNet(test_id,1, 0,'/home/m810z573/Downloads/f1tenth_benchmarks/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_TLN_L_Dag_noquantized.tflite')
     test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
 
-    plot_trajectory_analysis(planner.name, test_id)
+    if PLOT:
+        plot_trajectory_analysis(planner.name, test_id)
 
 if __name__ == "__main__":
     # generate_racelines()
