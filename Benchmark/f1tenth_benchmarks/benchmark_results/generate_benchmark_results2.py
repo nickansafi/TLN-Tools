@@ -2,7 +2,7 @@ from f1tenth_benchmarks.classic_racing.RaceTrackGenerator import RaceTrackGenera
 from f1tenth_benchmarks.classic_racing.GlobalPurePursuit import GlobalPurePursuit
 from f1tenth_benchmarks.classic_racing.GlobalMPCC import GlobalMPCC
 from f1tenth_benchmarks.mapless_racing.FollowTheGap import FollowTheGap
-from f1tenth_benchmarks.drl_racing.EndToEndAgent import EndToEndAgent, TrainEndToEndAgent, TinyAgent,  TrainTinyAgent
+from f1tenth_benchmarks.drl_racing.EndToEndAgent import EndToEndAgent, TrainEndToEndAgent, TinyAgent, TrainTinyAgent
 from f1tenth_benchmarks.zarrar.mlp_il import EndToEnd
 from f1tenth_benchmarks.zarrar.tiny_lidarnet2 import TinyLidarNet
 
@@ -12,8 +12,20 @@ from f1tenth_benchmarks.run_scripts.run_functions import *
 import os
 
 NUMBER_OF_LAPS = 10
-
 PLOT = False
+
+BENCH_ROOT = os.path.abspath(__file__).rpartition("/Benchmark")[0] + \
+    '/Benchmark/f1tenth_benchmarks/zarrar/'
+
+# Scale lists used during training — must mirror train2.py RUN_CONFIGS.
+MULTIRES_SCALES = [1.0, 0.75]
+SINGLE_100_SCALES = [1.0]
+SINGLE_075_SCALES = [0.75]
+
+
+def _tln_path(suffix: str) -> str:
+    return os.path.join(BENCH_ROOT, f'TLN_{suffix}_noquantized.tflite')
+
 
 def generate_racelines():
     map_list = ['example', 'MoscowRaceway']
@@ -25,17 +37,17 @@ def generate_racelines():
 
 def optimisation_and_tracking():
     test_id = "benchmark_pp"
-    planner = GlobalPurePursuit(test_id, False, planner_name="GlobalPlanPP", extra_params={"racetrack_set": "mu90"})
+    planner = GlobalPurePursuit(test_id, False, planner_name="GlobalPlanPP",
+                                extra_params={"racetrack_set": "mu90"})
     test_planning_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
-
     plot_trajectory_analysis(planner.name, test_id)
 
 
 def mpcc():
-    test_id = f"benchmark_mpcc"
-    planner = GlobalMPCC(test_id, False, planner_name="GlobalPlanMPCC", extra_params={"friction_mu": 0.9})
+    test_id = "benchmark_mpcc"
+    planner = GlobalMPCC(test_id, False, planner_name="GlobalPlanMPCC",
+                         extra_params={"friction_mu": 0.9})
     test_planning_all_maps(planner, test_id, number_of_laps=10)
-
     plot_trajectory_analysis(planner.name, test_id)
 
 
@@ -43,178 +55,141 @@ def follow_the_gap():
     test_id = "benchmark_ftg"
     planner = FollowTheGap(test_id)
     test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
-
     plot_trajectory_analysis(planner.name, test_id)
 
 
 def end_to_end_drl():
     test_id = "benchmark_e2e_drl"
-    training_map = "MoscowRaceway"
     seed_randomness(12)
-    # print(f"Training DRL agent: {test_id}")
-    # training_agent = TrainEndToEndAgent(training_map, test_id, extra_params={'reward': "TAL", 'tal_racetrack_set': "mu90"}) 
-    # simulate_training_steps(training_agent, training_map, test_id, extra_params={'n_sim_steps': 10})
-    # plot_drl_training(training_agent.name, test_id)
-
     testing_agent = EndToEndAgent(test_id)
     test_mapless_all_maps(testing_agent, test_id, number_of_laps=NUMBER_OF_LAPS)
     plot_trajectory_analysis(testing_agent.name, test_id)
-    
+
 
 def tinylidar_drl():
     test_id = "benchmark_tiny_drl"
-    training_map = "MoscowRaceway"
     seed_randomness(12)
-    # print(f"Training DRL agent: {test_id}")
-    # training_agent = TrainTinyAgent(training_map, test_id, extra_params={'reward': "TAL", 'tal_racetrack_set': "mu90"}) 
-    # simulate_training_steps(training_agent, training_map, test_id, extra_params={'n_sim_steps': 10})
-    # plot_drl_training(training_agent.name, test_id)
-
     testing_agent = TinyAgent(test_id)
     test_mapless_all_maps(testing_agent, test_id, number_of_laps=NUMBER_OF_LAPS)
-
     plot_trajectory_analysis(testing_agent.name, test_id)
+
+
+# ----------------------------------------------------------
+# Legacy TLN / MLP benchmarks (unchanged)
+# ----------------------------------------------------------
 
 def end_to_end_il():
     test_id = "benchmark_e2e_il"
-    planner = EndToEnd(test_id,4, os.path.abspath(__file__).rpartition("/Benchmark")[0]+'/Benchmark/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_MLP_S_noquantized.tflite')
+    planner = EndToEnd(test_id, 4,
+        os.path.abspath(__file__).rpartition("/Benchmark")[0] +
+        '/Benchmark/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_MLP_S_noquantized.tflite')
     test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
-
     plot_trajectory_analysis(planner.name, test_id)
+
 
 def end_to_end_il_m():
     test_id = "benchmark_e2e_il_m"
-    planner = EndToEnd(test_id,2, os.path.abspath(__file__).rpartition("/Benchmark")[0]+'/Benchmark/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_MLP_M_noquantized.tflite')
-    # planner = EndToEnd(test_id,2, '/home/m810z573/Downloads/f1tenth_benchmarks/f1tenth_benchmarks/zarrar/MLP_M_Dropout_noquantized.tflite')
+    planner = EndToEnd(test_id, 2,
+        os.path.abspath(__file__).rpartition("/Benchmark")[0] +
+        '/Benchmark/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_MLP_M_noquantized.tflite')
     test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
-
     plot_trajectory_analysis(planner.name, test_id)
+
 
 def end_to_end_il_l():
     test_id = "benchmark_e2e_il_l"
-    planner = EndToEnd(test_id, 1, os.path.abspath(__file__).rpartition("/Benchmark")[0]+'/Benchmark/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_paper_noquantized.tflite')
-    # planner = EndToEnd(test_id, 1, '/home/m810z573/Downloads/f1tenth_benchmarks/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_MLP_L_Dropout_noquantized.tflite')
+    planner = EndToEnd(test_id, 1,
+        os.path.abspath(__file__).rpartition("/Benchmark")[0] +
+        '/Benchmark/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_paper_noquantized.tflite')
     test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
-
     plot_trajectory_analysis(planner.name, test_id)
+
 
 def end_to_end_il_128():
     test_id = "benchmark_e2e_il_128"
-    planner = EndToEnd(test_id, 1, os.path.abspath(__file__).rpartition("/Benchmark")[0]+'/Benchmark/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_128_noquantized.tflite')
+    planner = EndToEnd(test_id, 1,
+        os.path.abspath(__file__).rpartition("/Benchmark")[0] +
+        '/Benchmark/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_128_noquantized.tflite')
     test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
-
     plot_trajectory_analysis(planner.name, test_id)
 
-def tinylidar_il_mean():
-    test_id = "benchmark_tiny_il_mean"
-    planner = TinyLidarNet(test_id,4, 1,os.path.abspath(__file__).rpartition("/Benchmark")[0]+'/Benchmark/f1tenth_benchmarks/zarrar/f1_tenth_model_smaller_mean_noquantized.tflite')
-    test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
 
-    plot_trajectory_analysis(planner.name, test_id)
+# ----------------------------------------------------------
+# New multi-resolution TLN benchmarks
+# ----------------------------------------------------------
 
-def tinylidar_il_max():
-    test_id = "benchmark_tiny_il_max"
-    planner = TinyLidarNet(test_id,4, 2,os.path.abspath(__file__).rpartition("/Benchmark")[0]+'/Benchmark/f1tenth_benchmarks/zarrar/f1_tenth_model_smaller_max_noquantized.tflite')
-    test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
-
-    plot_trajectory_analysis(planner.name, test_id)
-
-def tinylidar_il_min():
-    test_id = "benchmark_tiny_il_min"
-    planner = TinyLidarNet(test_id,4, 3,os.path.abspath(__file__).rpartition("/Benchmark")[0]+'/Benchmark/f1tenth_benchmarks/zarrar/f1_tenth_model_smaller_min_noquantized.tflite')
-    test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
-
-    plot_trajectory_analysis(planner.name, test_id)
-
-def tinylidar_il_temporal():
-    test_id = "benchmark_tiny_il_temporal"
-
+def tinylidar_il_multires_shared(scale):
+    """Multi-res model with shared affine, evaluated at the given scale."""
+    test_id = f"benchmark_tiny_il_multires_sharedaffine_{scale}"
     print(test_id)
-    #planner = TinyLidarNet(test_id, 2, 5,'/home/m810z573/Downloads/f1tenth_benchmarks/f1tenth_benchmarks/zarrar/f1_tenth_model_temporal_M_noquantized.tflite')
-    planner = TinyLidarNet(test_id, 2, 5,os.path.abspath(__file__).rpartition("/Benchmark")[0]+'/Benchmark/f1tenth_benchmarks/zarrar/f1_tenth_model_temporal_2M_noquantized.tflite')
-    
+    planner = TinyLidarNet(
+        test_id, 1, 0,
+        _tln_path('multires_sharedaffine'),
+        scale=scale,
+        resolution_scales=MULTIRES_SCALES,
+    )
     test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
-
-    plot_trajectory_analysis(planner.name, test_id)
-
-def tinylidar_il_birdeye():
-    test_id = "benchmark_tiny_il_birdeye"
-    print(test_id)
-    planner = TinyLidarNet(test_id, 2, 6,os.path.abspath(__file__).rpartition("/Benchmark")[0]+'/Benchmark/f1tenth_benchmarks/zarrar/f1_tenth_model_birdeye_M_noquantized.tflite')
-    
-    test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
-
-    plot_trajectory_analysis(planner.name, test_id)
-
-def tinylidar_il():
-    test_id = "benchmark_tiny_il"
-    print(test_id)
-    planner = TinyLidarNet(test_id,4, 0,os.path.abspath(__file__).rpartition("/Benchmark")[0]+'/Benchmark/f1tenth_benchmarks/zarrar/f1_tenth_model_smaller_noquantized.tflite')
-    test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
-
-    plot_trajectory_analysis(planner.name, test_id)
-
-def tinylidar_il_m():
-    test_id = "benchmark_tiny_il_m"
-    print(test_id)
-    planner = TinyLidarNet(test_id,2, 0,os.path.abspath(__file__).rpartition("/Benchmark")[0]+'/Benchmark/f1tenth_benchmarks/zarrar/f1_tenth_model_small_noquantized.tflite')
-    # planner = TinyLidarNet(test_id,2, 0,'/home/m810z573/Downloads/f1tenth_benchmarks/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_TLN_M_Dag_noquantized.tflite')
-    # planner = TinyLidarNet(test_id,2, 0,'/home/m810z573/Downloads/f1tenth_benchmarks/f1tenth_benchmarks/zarrar/TinyLidarNet_M_Dropout_noquantized.tflite')
-    test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
-
-    plot_trajectory_analysis(planner.name, test_id)
-
-def tinylidar_il_l():
-    test_id = "benchmark_tiny_il_l"
-    print(test_id)
-    planner = TinyLidarNet(test_id,1, 0,os.path.abspath(__file__).rpartition("/Benchmark")[0]+'/Benchmark/f1tenth_benchmarks/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_main_noquantized.tflite')
-    # planner = TinyLidarNet(test_id,1, 0,'/home/m810z573/Downloads/f1tenth_benchmarks/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_TLN_L_Dropout_noquantized.tflite')
-    # planner = TinyLidarNet(test_id,1, 0,'/home/m810z573/Downloads/f1tenth_benchmarks/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_TLN_L_Dag_noquantized.tflite')
-    test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
-
-    plot_trajectory_analysis(planner.name, test_id)
-
-
-def tinylidar_il_dropout():
-    test_id = "benchmark_tiny_il_dropout"
-    print(test_id)
-    planner = TinyLidarNet(test_id,1, 4,os.path.abspath(__file__).rpartition("/Benchmark")[0]+'/Benchmark/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_unifying_noquantized.tflite')
-    
-    test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
-
-    plot_trajectory_analysis(planner.name, test_id)
-
-def tinylidar_il_a(scale):
-    test_id = "benchmark_tiny_il_l" + str(scale)
-    print(test_id)
-    planner = TinyLidarNet(test_id,1, 0,os.path.abspath(__file__).rpartition("/Benchmark")[0]+'/Benchmark/f1tenth_benchmarks/zarrar/TLN_noquantized.tflite',scale)
-    # planner = TinyLidarNet(test_id,1, 0,'/home/m810z573/Downloads/f1tenth_benchmarks/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_TLN_L_Dropout_noquantized.tflite')
-    # planner = TinyLidarNet(test_id,1, 0,'/home/m810z573/Downloads/f1tenth_benchmarks/f1tenth_benchmarks/zarrar/f1_tenth_model_diff_TLN_L_Dag_noquantized.tflite')
-    test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
-
     if PLOT:
         plot_trajectory_analysis(planner.name, test_id)
 
+
+def tinylidar_il_multires_perbank(scale):
+    """Multi-res model with per-bank affine, evaluated at the given scale."""
+    test_id = f"benchmark_tiny_il_multires_perbankaffine_{scale}"
+    print(test_id)
+    planner = TinyLidarNet(
+        test_id, 1, 0,
+        _tln_path('multires_perbankaffine'),
+        scale=scale,
+        resolution_scales=MULTIRES_SCALES,
+    )
+    test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
+    if PLOT:
+        plot_trajectory_analysis(planner.name, test_id)
+
+
+def tinylidar_il_single_100():
+    """Single-scale model trained exclusively at 1.00x."""
+    test_id = "benchmark_tiny_il_single1.00"
+    print(test_id)
+    planner = TinyLidarNet(
+        test_id, 1, 0,
+        _tln_path('single1.00'),
+        scale=1.0,
+        resolution_scales=SINGLE_100_SCALES,
+    )
+    test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
+    if PLOT:
+        plot_trajectory_analysis(planner.name, test_id)
+
+
+def tinylidar_il_single_075():
+    """Single-scale model trained exclusively at 0.75x."""
+    test_id = "benchmark_tiny_il_single0.75"
+    print(test_id)
+    planner = TinyLidarNet(
+        test_id, 1, 0,
+        _tln_path('single0.75'),
+        scale=0.75,
+        resolution_scales=SINGLE_075_SCALES,
+    )
+    test_mapless_all_maps(planner, test_id, number_of_laps=NUMBER_OF_LAPS)
+    if PLOT:
+        plot_trajectory_analysis(planner.name, test_id)
+
+
+# Back-compat shim: old callers that used `tinylidar_il_a(scale)` against
+# the original multires-shared export still work.
+def tinylidar_il_a(scale):
+    tinylidar_il_multires_shared(scale)
+
+
 if __name__ == "__main__":
-    # generate_racelines()
-    # # mpcc()
-    # optimisation_and_tracking()
-    # follow_the_gap()
-    # end_to_end_drl()
-    # tinylidar_drl()
-    # end_to_end_il_128()
+    # Multires models: evaluate at both scales they were trained on.
+    for s in MULTIRES_SCALES:
+        tinylidar_il_multires_shared(s)
+        tinylidar_il_multires_perbank(s)
 
-    # tinylidar_il_temporal()
-    # tinylidar_il_birdeye()
-    # tinylidar_il_min()
-    # tinylidar_il_max()
-    # tinylidar_il_mean()
-    # tinylidar_il_dropout()
-    tinylidar_il_a(0.75)
-    tinylidar_il_a(1.00)
-
-
-
-
-
-
+    # Single-scale models: one run each, at their native resolution.
+    tinylidar_il_single_100()
+    tinylidar_il_single_075()
