@@ -1,10 +1,6 @@
 if [ "$1" = "s" ]; then
     python3 -m venv venv
     source venv/bin/activate
-    pip3 install scikit-learn
-    pip3 install tensorflow==2.13
-    pip3 install rosbags
-    pip3 install pyglet
     cd Benchmark
     pip3 install -r requirements.txt
     pip3 install -e .
@@ -12,6 +8,7 @@ if [ "$1" = "s" ]; then
     git submodule update
     cd trajectory_planning_helpers
     pip3 install -e .
+    pip3 install numba numpy scikit-learn tensorflow rosbags pyglet
 elif [ "$1" = "t" ]; then
     source venv/bin/activate
     python3 $2.py
